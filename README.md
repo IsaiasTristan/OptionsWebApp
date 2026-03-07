@@ -1,16 +1,43 @@
-# React + Vite
+# OPTIX Platform (Source of Truth)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Production source of truth for the options modeling frontend.
 
-Currently, two official plugins are available:
+## Scope
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- Frontend runtime: React + Vite app in this repository.
+- Data backend: Supabase tables populated by `../data-pipeline`.
+- Watchlist persistence: Supabase (cloud) with local fallback only when cloud is unavailable.
 
-## React Compiler
+## Local Development
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+npm install
+npm run dev
+```
 
-## Expanding the ESLint configuration
+## Build
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```bash
+npm run lint
+npm run build
+npm run preview
+```
+
+## Architecture
+
+- UI shell and routing: `src/App.jsx`
+- Options model UI: `src/OptionsModel.jsx`
+- Screener/QC dashboard: `src/ScreenerDashboard.jsx`
+- Data access layer: `src/lib/screenerApi.js`
+- Supabase client and strategy persistence: `src/lib/supabase.js`
+
+## Operating Model
+
+See:
+- `docs/OPERATING_MODEL.md`
+- `docs/DATA_CONTRACT.md`
+
+## Non-Goals
+
+- No feature development in deprecated standalone folder `../Options Model`.
+- No schema changes in production without migration discipline and contract update.

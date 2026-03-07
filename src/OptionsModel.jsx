@@ -14,6 +14,12 @@ import {
   Area,
   ReferenceLine,
 } from "recharts";
+import {
+  fetchStrategies,
+  saveStrategy,
+  deleteStrategy,
+  isCloudEnabled,
+} from "./lib/supabase.js";
 
 // ─── BLACK-SCHOLES ENGINE ───────────────────────────────────────────────────
 function erf(x) {
@@ -170,6 +176,25 @@ function expiryToDte(expiryStr) {
   const today = new Date(); today.setHours(0,0,0,0);
   const exp   = new Date(expiryStr); exp.setHours(0,0,0,0);
   return Math.max(1, Math.round((exp - today) / 86400000));
+}
+
+// ─── DYNAMIC RISK-FREE RATE ──────────────────────────────────────────────────
+// Interpolated from a US Treasury yield curve approximation.
+// Update the curve array as market rates change.
+function getRiskFreeRate(dte) {
+  const curve = [
+    [7,   4.30], [30,  4.25], [60,  4.20], [90,  4.15],
+    [180, 4.10], [365, 4.05], [730, 4.00],
+  ];
+  if (dte <= curve[0][0]) return curve[0][1];
+  if (dte >= curve[curve.length - 1][0]) return curve[curve.length - 1][1];
+  for (let i = 0; i < curve.length - 1; i++) {
+    if (dte >= curve[i][0] && dte <= curve[i + 1][0]) {
+      const t = (dte - curve[i][0]) / (curve[i + 1][0] - curve[i][0]);
+      return +(curve[i][1] + t * (curve[i + 1][1] - curve[i][1])).toFixed(3);
+    }
+  }
+  return 4.15;
 }
 
 // ─── STRATEGY BUILDER ───────────────────────────────────────────────────────
@@ -479,9 +504,8 @@ function VolSurface3D({ surfacePoints, spot, surfaceTenors, expiryToDteFn }) {
 
 const defaultLegs = [{ id:1, type:"call", dir:"long", qty:1, strikePct:100, iv:25, bidPrice:null, askPrice:null }];
 
-export default function OptionsModel() {
+export default function OptionsModel({ loadedTicker = null }) {
   const [spot, setSpot] = useState(100);
-  const [r, setR] = useState(5);
   // Default expiry = today + 75 days
   const todayStr = new Date().toISOString().split('T')[0];
   const [expiryDate, setExpiryDate] = useState(() => {
@@ -520,19 +544,48 @@ export default function OptionsModel() {
   const [surfaceNextId, setSurfaceNextId] = useState(100);
   const [surfaceEnabled, setSurfaceEnabled] = useState(false);
 
-  // ── Watchlist ────────────────────────────────────────────────────────────────
+  // ── Watchlist (cloud via Supabase when configured, else localStorage) ─────────
   const [ticker, setTicker] = useState("AAPL");
-  const [watchlist, setWatchlist] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("optix_watchlist") || "[]"); }
-    catch { return []; }
-  });
+  const [watchlist, setWatchlist] = useState([]);
   const [watchlistOpen, setWatchlistOpen] = useState(false);
   const [saveNameDraft, setSaveNameDraft] = useState("");
 
-  // Persist watchlist to localStorage whenever it changes
+  // Pre-populate from Screener when a ticker is loaded via "→ Model"
+  useEffect(() => {
+    if (!loadedTicker) return;
+    setTicker(loadedTicker.symbol ?? "");
+    if (loadedTicker.spot != null && loadedTicker.spot > 0) setSpot(loadedTicker.spot);
+    if (loadedTicker.surfacePoints && loadedTicker.surfacePoints.length > 0) {
+      setSurfacePoints(loadedTicker.surfacePoints);
+      setSurfaceEnabled(true);
+    }
+    if (loadedTicker.rv20 != null) setRv20(+loadedTicker.rv20.toFixed(1));
+  }, [loadedTicker]);
+
+  // Load watchlist once on mount: from Supabase if configured and working, else localStorage
+  useEffect(() => {
+    const loadLocal = () => {
+      try {
+        setWatchlist(JSON.parse(localStorage.getItem("optix_watchlist") || "[]"));
+      } catch {
+        setWatchlist([]);
+      }
+    };
+    if (isCloudEnabled()) {
+      fetchStrategies().then(({ list, error }) => {
+        if (error) loadLocal();
+        else setWatchlist(list);
+      });
+    } else {
+      loadLocal();
+    }
+  }, []);
+
   const persistWatchlist = (wl) => {
     setWatchlist(wl);
-    try { localStorage.setItem("optix_watchlist", JSON.stringify(wl)); } catch {}
+    if (!isCloudEnabled()) {
+      try { localStorage.setItem("optix_watchlist", JSON.stringify(wl)); } catch {}
+    }
   };
 
   const currentSnapshot = () => ({
@@ -545,12 +598,29 @@ export default function OptionsModel() {
     savedAt: new Date().toISOString(),
   });
 
-  const saveToWatchlist = () => {
-    const name = saveNameDraft.trim() || ticker;
+  const saveToWatchlist = async () => {
+    const name = (saveNameDraft.trim() || ticker || "").trim();
     if (!name) return;
     const snap = { ...currentSnapshot(), ticker: name };
     const updated = [snap, ...watchlist.filter(w => w.ticker !== name)];
-    persistWatchlist(updated);
+    if (isCloudEnabled()) {
+      try {
+        const ok = await saveStrategy(name, snap);
+        if (ok) {
+          const { list } = await fetchStrategies();
+          setWatchlist(list);
+        } else {
+          setWatchlist(updated);
+          try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch {}
+        }
+      } catch (e) {
+        console.warn("Cloud save failed, saving locally:", e);
+        setWatchlist(updated);
+        try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch {}
+      }
+    } else {
+      persistWatchlist(updated);
+    }
     setSaveNameDraft("");
   };
 
@@ -570,12 +640,30 @@ export default function OptionsModel() {
     setWatchlistOpen(false);
   };
 
-  const deleteFromWatchlist = (tickerName) => {
-    persistWatchlist(watchlist.filter(w => w.ticker !== tickerName));
+  const deleteFromWatchlist = async (tickerName) => {
+    const filtered = watchlist.filter(w => w.ticker !== tickerName);
+    if (isCloudEnabled()) {
+      try {
+        const ok = await deleteStrategy(tickerName);
+        if (ok) {
+          const { list } = await fetchStrategies();
+          setWatchlist(list);
+        } else {
+          setWatchlist(filtered);
+          try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch {}
+        }
+      } catch (e) {
+        console.warn("Cloud delete failed, updating locally:", e);
+        setWatchlist(filtered);
+        try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch {}
+      }
+    } else {
+      persistWatchlist(filtered);
+    }
   };
 
   const T = dte/365;
-  const rf = r/100;
+  const rf = getRiskFreeRate(dte) / 100;
 
   // Apply strategy preset
   const applyStrategy = useCallback((strat) => {
@@ -1021,6 +1109,7 @@ export default function OptionsModel() {
                 border:"1px solid "+(watchlistOpen?"#a3cef0":"#dde3eb"), whiteSpace:"nowrap"}}>
               📋 Watchlist {watchlist.length>0&&<span style={{background:"#0055a5",color:"#fff",
                 borderRadius:8,padding:"0 5px",fontSize:9,marginLeft:3}}>{watchlist.length}</span>}
+              {isCloudEnabled()&&<span style={{marginLeft:4,fontSize:8,color:"#006b44",fontWeight:700}}>☁</span>}
             </button>
             {watchlistOpen && (
               <div style={{position:"absolute", top:"calc(100% + 6px)", left:0, zIndex:1000,
@@ -1084,11 +1173,13 @@ export default function OptionsModel() {
               {dte}d
             </div>
           </div>
-          {/* RATE */}
+          {/* RATE — dynamic, shown read-only */}
           <div style={{display:"flex", alignItems:"center", gap:6}}>
-            <span style={{fontSize:9, color:"#5a6e85", letterSpacing:"0.1em"}}>RATE %</span>
-            <input type="number" value={r} min={0} max={20} step={0.25}
-              onChange={e=>setR(+e.target.value)} style={{width:60}}/>
+            <span style={{fontSize:9, color:"#5a6e85", letterSpacing:"0.1em"}}>RATE</span>
+            <div style={{background:"#f0f2f5", border:"1px solid #c5cdd8", borderRadius:4,
+              padding:"4px 8px", fontSize:11, color:"#5a6e85", fontWeight:600, whiteSpace:"nowrap"}}>
+              {getRiskFreeRate(dte).toFixed(2)}%
+            </div>
           </div>
           {/* STRATEGY */}
           <div style={{display:"flex", alignItems:"center", gap:6}}>
@@ -1122,6 +1213,114 @@ export default function OptionsModel() {
           </div>
 
         </div>
+      </div>
+
+      {/* ── STRUCTURE BUILDER (always visible, above tabs) ── */}
+      <div style={{background:"#ffffff", borderBottom:"1px solid #dde3eb", padding:"10px 24px 14px"}}>
+        <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6}}>
+          <div>
+            <div className="section-title" style={{marginBottom:0}}>Structure Builder</div>
+            <div style={{display:"flex", alignItems:"center", gap:8, marginTop:2}}>
+              <span style={{fontSize:9, color:"#7a8ea5"}}>Enter Bid $ / Ask $ from Fidelity chain → model back-solves IV</span>
+              {surfaceEnabled && (
+                <span style={{fontSize:9, background:"#d4f5e9", color:"#006b44", padding:"2px 7px",
+                  borderRadius:3, fontWeight:700, border:"1px solid #a3e4c7"}}>
+                  ↗ SURFACE ACTIVE — legs auto-fill IV from fitted surface
+                </span>
+              )}
+            </div>
+          </div>
+          <button className="btn btn-primary" onClick={addLeg}>+ Add Leg</button>
+        </div>
+        {/* Header row */}
+        <div style={{display:"grid", gridTemplateColumns:"28px 70px 72px 46px 120px 76px 130px 76px 28px", gap:6, padding:"4px 8px", fontSize:9, color:"#5a6e85", letterSpacing:"0.1em", marginBottom:4}}>
+          {["","TYPE","DIR","QTY","STRIKE %","STRIKE ($)","BID $ / ASK $ (Fidelity)","MID IV (solved)",""].map((h,i)=>(
+            <div key={i} style={{textAlign: i===0||i===8 ? "center" : "left"}}>{h}</div>
+          ))}
+        </div>
+        {legs.map((l, idx)=>{
+          return (
+            <div key={l.id} style={{
+              background:"#f8fafc", border:"1px solid #dde3eb", borderRadius:6,
+              padding:"6px 8px", marginBottom:6,
+              display:"grid",
+              gridTemplateColumns:"28px 70px 72px 46px 120px 76px 130px 76px 28px",
+              gap:6, alignItems:"center"
+            }}>
+              <div style={{width:20, height:20, borderRadius:3, background:"#e2e6ec", display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, color:"#5a6e85", fontWeight:700}}>{idx+1}</div>
+              <select value={l.type} onChange={e=>updateLeg(l.id,"type",e.target.value)} style={{width:"100%"}}>
+                <option value="call">Call</option>
+                <option value="put">Put</option>
+              </select>
+              <select value={l.dir} onChange={e=>updateLeg(l.id,"dir",e.target.value)}
+                style={{width:"100%", color:l.dir==="long"?"#006b44":"#c0182e", fontWeight:600}}>
+                <option value="long">Long</option>
+                <option value="short">Short</option>
+              </select>
+              <input type="number" value={l.qty} min={1} max={100} step={1}
+                onChange={e=>updateLeg(l.id,"qty",+e.target.value)} style={{width:"100%"}}/>
+              <div style={{display:"flex", flexDirection:"column", gap:2}}>
+                <input type="number" value={l.strikePct} min={50} max={150} step={0.5}
+                  onChange={e=>updateLeg(l.id,"strikePct",+e.target.value)} style={{width:"100%"}}/>
+                <input type="range" min={50} max={150} step={0.5} value={l.strikePct}
+                  onChange={e=>updateLeg(l.id,"strikePct",+e.target.value)} style={{width:"100%"}}/>
+              </div>
+              <input type="number" value={(spot*l.strikePct/100).toFixed(2)} readOnly
+                style={{width:"100%", color:"#0055a5", background:"#f0f4f8", cursor:"default", fontWeight:600}}/>
+              <div style={{display:"flex", gap:3, alignItems:"center"}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:8, color:"#c0182e", letterSpacing:"0.05em", marginBottom:1}}>BID $</div>
+                  <input type="number" value={l.bidPrice ?? ""} min={0.01} max={9999} step={0.01}
+                    placeholder="e.g. 10.05"
+                    onChange={e=>updateLeg(l.id,"bidPrice", e.target.value===""?null:+e.target.value)}
+                    style={{width:"100%", borderColor:"#f5b8c2"}}/>
+                </div>
+                <div style={{fontSize:10, color:"#a8b8cc", paddingTop:12}}>/</div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:8, color:"#006b44", letterSpacing:"0.05em", marginBottom:1}}>ASK $</div>
+                  <input type="number" value={l.askPrice ?? ""} min={0.01} max={9999} step={0.01}
+                    placeholder="e.g. 12.50"
+                    onChange={e=>updateLeg(l.id,"askPrice", e.target.value===""?null:+e.target.value)}
+                    style={{width:"100%", borderColor:"#a3e4c7"}}/>
+                </div>
+              </div>
+              {(() => {
+                const pl = processedLegs.find(p=>p.id===l.id) || {};
+                const hasPrices = l.bidPrice != null || l.askPrice != null;
+                const biv = pl.bidIV, aiv = pl.askIV;
+                const mid = pl.baseIV != null ? pl.baseIV.toFixed(1) : (l.iv||25).toFixed(1);
+                const spd = (biv != null && aiv != null) ? (aiv - biv).toFixed(1) : null;
+                const src = hasPrices ? "price" : pl.fromSurface ? "surface" : "manual";
+                const srcColors = {
+                  price:   { bg:"#e8f3fc", text:"#0055a5", label:"solved ↑" },
+                  surface: { bg:"#d4f5e9", text:"#006b44", label:"↗ surface" },
+                  manual:  { bg:"#f0f2f5", text:"#a8b8cc", label:"manual" },
+                };
+                const sc = srcColors[src];
+                return (
+                  <div style={{textAlign:"center", padding:"2px 0"}}>
+                    <div style={{fontSize:14, fontWeight:700, color: src==="manual"?"#a8b8cc":"#0055a5"}}>{mid}%</div>
+                    {spd && (
+                      <div style={{fontSize:8, color:"#5a6e85", marginTop:1}}>
+                        {biv!=null?biv.toFixed(1):"—"} / {aiv!=null?aiv.toFixed(1):"—"}
+                      </div>
+                    )}
+                    {spd && <div style={{fontSize:8, color:"#a8b8cc"}}>spd {spd}v</div>}
+                    <div style={{fontSize:8, background:sc.bg, color:sc.text,
+                      borderRadius:3, padding:"1px 4px", marginTop:2, display:"inline-block", fontWeight:700}}>
+                      {sc.label}
+                    </div>
+                    {src==="manual" && !surfaceEnabled && (
+                      <div style={{fontSize:7, color:"#c5cdd8", marginTop:1}}>enter prices or enable surface</div>
+                    )}
+                  </div>
+                );
+              })()}
+              <button className="btn btn-danger" onClick={()=>removeLeg(l.id)}
+                style={{width:26,height:26,display:"flex",alignItems:"center",justifyContent:"center",padding:0,fontSize:14}}>×</button>
+            </div>
+          );
+        })}
       </div>
 
       {/* Tabs */}
@@ -2211,130 +2410,6 @@ export default function OptionsModel() {
           </div>
         )}
 
-        {/* ── TRADE BUILDER (always visible at bottom) ── */}
-        <div style={{marginTop:16, background:"#ffffff", border:"1px solid #dde3eb", borderRadius:8, padding:14}}>
-          <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6}}>
-            <div>
-              <div className="section-title" style={{marginBottom:0}}>Structure Builder</div>
-              <div style={{display:"flex", alignItems:"center", gap:8, marginTop:2}}>
-                <span style={{fontSize:9, color:"#7a8ea5"}}>Enter Bid $ / Ask $ from Fidelity chain → model back-solves IV</span>
-                {surfaceEnabled && (
-                  <span style={{fontSize:9, background:"#d4f5e9", color:"#006b44", padding:"2px 7px",
-                    borderRadius:3, fontWeight:700, border:"1px solid #a3e4c7"}}>
-                    ↗ SURFACE ACTIVE — legs auto-fill IV from fitted surface
-                  </span>
-                )}
-              </div>
-            </div>
-            <button className="btn btn-primary" onClick={addLeg}>+ Add Leg</button>
-          </div>
-          {/* Header — grid matches leg-row exactly */}
-          <div style={{display:"grid", gridTemplateColumns:"28px 70px 72px 46px 120px 76px 130px 76px 28px", gap:6, padding:"4px 8px", fontSize:9, color:"#5a6e85", letterSpacing:"0.1em", marginBottom:4}}>
-            {["","TYPE","DIR","QTY","STRIKE %","STRIKE ($)","BID $ / ASK $ (Fidelity)","MID IV (solved)",""].map((h,i)=>(
-              <div key={i} style={{textAlign: i===0||i===8 ? "center" : "left"}}>{h}</div>
-            ))}
-          </div>
-          {legs.map((l, idx)=>{
-            return (
-              <div key={l.id} style={{
-                background:"#f8fafc", border:"1px solid #dde3eb", borderRadius:6,
-                padding:"6px 8px", marginBottom:6,
-                display:"grid",
-                gridTemplateColumns:"28px 70px 72px 46px 120px 76px 130px 76px 28px",
-                gap:6, alignItems:"center"
-              }}>
-                {/* # */}
-                <div style={{width:20, height:20, borderRadius:3, background:"#e2e6ec", display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, color:"#5a6e85", fontWeight:700}}>{idx+1}</div>
-
-                {/* TYPE */}
-                <select value={l.type} onChange={e=>updateLeg(l.id,"type",e.target.value)} style={{width:"100%"}}>
-                  <option value="call">Call</option>
-                  <option value="put">Put</option>
-                </select>
-
-                {/* DIR */}
-                <select value={l.dir} onChange={e=>updateLeg(l.id,"dir",e.target.value)}
-                  style={{width:"100%", color:l.dir==="long"?"#006b44":"#c0182e", fontWeight:600}}>
-                  <option value="long">Long</option>
-                  <option value="short">Short</option>
-                </select>
-
-                {/* QTY */}
-                <input type="number" value={l.qty} min={1} max={100} step={1}
-                  onChange={e=>updateLeg(l.id,"qty",+e.target.value)} style={{width:"100%"}}/>
-
-                {/* STRIKE % + slider */}
-                <div style={{display:"flex", flexDirection:"column", gap:2}}>
-                  <input type="number" value={l.strikePct} min={50} max={150} step={0.5}
-                    onChange={e=>updateLeg(l.id,"strikePct",+e.target.value)} style={{width:"100%"}}/>
-                  <input type="range" min={50} max={150} step={0.5} value={l.strikePct}
-                    onChange={e=>updateLeg(l.id,"strikePct",+e.target.value)} style={{width:"100%"}}/>
-                </div>
-
-                {/* STRIKE $ — read only, derived */}
-                <input type="number" value={(spot*l.strikePct/100).toFixed(2)} readOnly
-                  style={{width:"100%", color:"#0055a5", background:"#f0f4f8", cursor:"default", fontWeight:600}}/>
-
-                {/* BID PRICE / ASK PRICE — paste from Fidelity */}
-                <div style={{display:"flex", gap:3, alignItems:"center"}}>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:8, color:"#c0182e", letterSpacing:"0.05em", marginBottom:1}}>BID $</div>
-                    <input type="number" value={l.bidPrice ?? ""} min={0.01} max={9999} step={0.01}
-                      placeholder="e.g. 10.05"
-                      onChange={e=>updateLeg(l.id,"bidPrice", e.target.value===""?null:+e.target.value)}
-                      style={{width:"100%", borderColor:"#f5b8c2"}}/>
-                  </div>
-                  <div style={{fontSize:10, color:"#a8b8cc", paddingTop:12}}>/</div>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:8, color:"#006b44", letterSpacing:"0.05em", marginBottom:1}}>ASK $</div>
-                    <input type="number" value={l.askPrice ?? ""} min={0.01} max={9999} step={0.01}
-                      placeholder="e.g. 12.50"
-                      onChange={e=>updateLeg(l.id,"askPrice", e.target.value===""?null:+e.target.value)}
-                      style={{width:"100%", borderColor:"#a3e4c7"}}/>
-                  </div>
-                </div>
-
-                {/* SOLVED MID IV — from prices, surface, or manual */}
-                {(() => {
-                  const pl = processedLegs.find(p=>p.id===l.id) || {};
-                  const hasPrices = l.bidPrice != null || l.askPrice != null;
-                  const biv = pl.bidIV, aiv = pl.askIV;
-                  const mid = pl.baseIV != null ? pl.baseIV.toFixed(1) : (l.iv||25).toFixed(1);
-                  const spd = (biv != null && aiv != null) ? (aiv - biv).toFixed(1) : null;
-                  const src = hasPrices ? "price" : pl.fromSurface ? "surface" : "manual";
-                  const srcColors = {
-                    price:   { bg:"#e8f3fc", text:"#0055a5", label:"solved ↑" },
-                    surface: { bg:"#d4f5e9", text:"#006b44", label:"↗ surface" },
-                    manual:  { bg:"#f0f2f5", text:"#a8b8cc", label:"manual" },
-                  };
-                  const sc = srcColors[src];
-                  return (
-                    <div style={{textAlign:"center", padding:"2px 0"}}>
-                      <div style={{fontSize:14, fontWeight:700, color: src==="manual"?"#a8b8cc":"#0055a5"}}>{mid}%</div>
-                      {spd && (
-                        <div style={{fontSize:8, color:"#5a6e85", marginTop:1}}>
-                          {biv!=null?biv.toFixed(1):"—"} / {aiv!=null?aiv.toFixed(1):"—"}
-                        </div>
-                      )}
-                      {spd && <div style={{fontSize:8, color:"#a8b8cc"}}>spd {spd}v</div>}
-                      <div style={{fontSize:8, background:sc.bg, color:sc.text,
-                        borderRadius:3, padding:"1px 4px", marginTop:2, display:"inline-block", fontWeight:700}}>
-                        {sc.label}
-                      </div>
-                      {src==="manual" && !surfaceEnabled && (
-                        <div style={{fontSize:7, color:"#c5cdd8", marginTop:1}}>enter prices or enable surface</div>
-                      )}
-                    </div>
-                  );
-                })()}
-
-                {/* DELETE */}
-                <button className="btn btn-danger" onClick={()=>removeLeg(l.id)}
-                  style={{width:26,height:26,display:"flex",alignItems:"center",justifyContent:"center",padding:0,fontSize:14}}>×</button>
-              </div>
-            );
-          })}
-        </div>
       </div>
     </div>
   );

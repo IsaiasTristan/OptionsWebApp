@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useRef, useEffect } from "react";
+import React, { useState, useMemo, useCallback, useEffect } from "react";
 import {
   LineChart,
   Line,
@@ -73,11 +73,6 @@ function computeIV(price, S, K, T, r, type, tol=0.0001, maxIter=200) {
 }
 
 // ─── SKEW / TERM STRUCTURE (simplified parametric) ──────────────────────────
-function skewIV(baseIV, skewSlope, convexity, strike, spot) {
-  const moneyness = Math.log(strike/spot);
-  return Math.max(0.01, baseIV + skewSlope*moneyness + convexity*moneyness*moneyness);
-}
-
 
 // ─── VOL SURFACE ENGINE ──────────────────────────────────────────────────────
 
@@ -107,8 +102,7 @@ function fitSlice(points, S) {
     t0+=v; t1+=m*v; t2+=m*m*v;
   }
   // Solve 3x3 system [s0,s1,s2; s1,s2,s3; s2,s3,s4] * [a,b,c] = [t0,t1,t2]
-  const n=ms.length;
-  // Use simple matrix inverse for 3x3
+    // Use simple matrix inverse for 3x3
   const M = [[s0,s1,s2],[s1,s2,s3],[s2,s3,s4]];
   const T = [t0,t1,t2];
   // Gaussian elimination
@@ -253,8 +247,7 @@ function VolSurface3D({ surfacePoints, spot, surfaceTenors, expiryToDteFn }) {
   const [dragging, setDragging] = React.useState(false);
   const dragStart = React.useRef(null);
   const rotStart  = React.useRef(null);
-  const [colorMode, setColorMode] = React.useState("iv"); // iv | tenor | moneyness
-
+  
   // Build grid data
   const gridData = React.useMemo(() => {
     if (surfacePoints.length < 2 || surfaceTenors.length < 1) return null;
@@ -281,7 +274,7 @@ function VolSurface3D({ surfacePoints, spot, surfaceTenors, expiryToDteFn }) {
       grid.push(row);
     }
     return { grid, minIV, maxIV, minStrike, maxStrike, minDte, maxDte, STRIKE_STEPS, TENOR_STEPS };
-  }, [surfacePoints, spot, surfaceTenors]);
+  }, [surfacePoints, spot, surfaceTenors, expiryToDteFn]);
 
   // Draw
   React.useEffect(() => {
@@ -321,7 +314,7 @@ function VolSurface3D({ surfacePoints, spot, surfaceTenors, expiryToDteFn }) {
       };
     }
 
-    function ivColor(iv, t) {
+    function ivColor(iv) {
       const norm = (iv - minIV) / ivRange;
       // Blue (low IV) → cyan → green → yellow → red (high IV)
       let r, g, b;
@@ -387,8 +380,7 @@ function VolSurface3D({ surfacePoints, spot, surfaceTenors, expiryToDteFn }) {
     });
 
     // Draw ATM plane (vertical line at spot)
-    const atmNz = 0; // spot is center
-    for (let ti = 0; ti < TENOR_STEPS; ti++) {
+        for (let ti = 0; ti < TENOR_STEPS; ti++) {
       const si = Math.round(STRIKE_STEPS / 2);
       const v0 = verts[ti][si], v1 = verts[ti+1][si];
       ctx.beginPath();
@@ -402,8 +394,7 @@ function VolSurface3D({ surfacePoints, spot, surfaceTenors, expiryToDteFn }) {
     // Axes labels
     ctx.font = "bold 10px 'JetBrains Mono', monospace";
     ctx.fillStyle = "#4a9eff";
-    const axOrigin = project(-1, 0, -1);
-    const axTenor  = project(1, 0, -1);
+        const axTenor  = project(1, 0, -1);
     const axStrike = project(-1, 0, 1);
     const axIV     = project(-1, 0.75, -1);
 
@@ -584,13 +575,13 @@ export default function OptionsModel({ loadedTicker = null }) {
   const persistWatchlist = (wl) => {
     setWatchlist(wl);
     if (!isCloudEnabled()) {
-      try { localStorage.setItem("optix_watchlist", JSON.stringify(wl)); } catch {}
+      try { localStorage.setItem("optix_watchlist", JSON.stringify(wl)); } catch { void 0; }
     }
   };
 
   const currentSnapshot = () => ({
     ticker,
-    spot, r, expiryDate,
+    spot, expiryDate,
     legs, strategy,
     rv20, rv60, rv1y, iv1yPct,
     margin,
@@ -611,12 +602,12 @@ export default function OptionsModel({ loadedTicker = null }) {
           setWatchlist(list);
         } else {
           setWatchlist(updated);
-          try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch {}
+          try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch { void 0; }
         }
       } catch (e) {
         console.warn("Cloud save failed, saving locally:", e);
         setWatchlist(updated);
-        try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch {}
+        try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch { void 0; }
       }
     } else {
       persistWatchlist(updated);
@@ -627,8 +618,7 @@ export default function OptionsModel({ loadedTicker = null }) {
   const loadFromWatchlist = (snap) => {
     setTicker(snap.ticker);
     setSpot(snap.spot);
-    setR(snap.r);
-    setExpiryDate(snap.expiryDate);
+        setExpiryDate(snap.expiryDate);
     setLegs(snap.legs);
     setStrategy(snap.strategy || "Custom");
     setRv20(snap.rv20); setRv60(snap.rv60); setRv1y(snap.rv1y);
@@ -636,7 +626,7 @@ export default function OptionsModel({ loadedTicker = null }) {
     setMargin(snap.margin || 20);
     setSurfacePoints(snap.surfacePoints || []);
     setSurfaceEnabled(snap.surfaceEnabled || false);
-    setSurfaceNextId(Date.now());
+    setSurfaceNextId(Math.max(100, ((snap.surfacePoints || []).length + 100)));
     setWatchlistOpen(false);
   };
 
@@ -650,12 +640,12 @@ export default function OptionsModel({ loadedTicker = null }) {
           setWatchlist(list);
         } else {
           setWatchlist(filtered);
-          try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch {}
+          try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch { void 0; }
         }
       } catch (e) {
         console.warn("Cloud delete failed, updating locally:", e);
         setWatchlist(filtered);
-        try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch {}
+        try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch { void 0; }
       }
     } else {
       persistWatchlist(filtered);
@@ -873,9 +863,7 @@ export default function OptionsModel({ loadedTicker = null }) {
   , [surfacePoints]);
 
   // Helper: convert a surface expiry date to DTE for the fitting engine
-  const surfaceExpiryToDte = (expiry) => expiryToDte(expiry);
-
-  const surfaceHeatmapDtes = useMemo(() => surfaceTenors.length > 0 ? surfaceTenors : [30,60,90], [surfaceTenors]);
+    const surfaceHeatmapDtes = useMemo(() => surfaceTenors.length > 0 ? surfaceTenors : [30,60,90], [surfaceTenors]);
 
   const surfaceHeatmapData = useMemo(() => {
     const hStrikes = Array.from({length:21},(_,i)=>+(spot*0.8+i*spot*0.02).toFixed(1));
@@ -890,7 +878,7 @@ export default function OptionsModel({ loadedTicker = null }) {
       });
       return row;
     });
-  }, [surfacePoints, spot, surfaceTenors]);
+  }, [surfacePoints, spot, surfaceHeatmapDtes]);
 
   const surfaceIvColorRange = useMemo(() => {
     const all = surfaceHeatmapData.flatMap(r=>surfaceHeatmapDtes.map(t=>r[t+"d"])).filter(Boolean);
@@ -1744,9 +1732,8 @@ export default function OptionsModel({ loadedTicker = null }) {
                     </tr>
                   </thead>
                   <tbody>
-                    {processedLegs.map((l,i)=>{
-                      const hasPrices = l.bidPrice != null && l.askPrice != null;
-                      const bidIVd = l.bidIV != null ? l.bidIV.toFixed(1)+"%" : "—";
+                    {processedLegs.map((l)=>{
+                                            const bidIVd = l.bidIV != null ? l.bidIV.toFixed(1)+"%" : "—";
                       const askIVd = l.askIV != null ? l.askIV.toFixed(1)+"%" : "—";
                       const midIVd = (l.iv - volShift).toFixed(2)+"%";
                       const spd = (l.bidIV != null && l.askIV != null) ? (l.askIV - l.bidIV).toFixed(1) : "—";
@@ -2414,3 +2401,8 @@ export default function OptionsModel({ loadedTicker = null }) {
     </div>
   );
 }
+
+
+
+
+

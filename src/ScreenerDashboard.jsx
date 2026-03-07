@@ -570,9 +570,7 @@ function TickerCard({ symbol, sector, chartType, surfaceHistory, onLoadTicker })
   const [loadingModel, setLoadingModel] = useState(false);
 
   useEffect(() => {
-    let cancelled = false;
-    setLoadingChain(true);
-    fetchTickerChainToday(symbol).then((data) => {
+    let cancelled = false;    fetchTickerChainToday(symbol).then((data) => {
       if (!cancelled) { setChainData(data); setLoadingChain(false); }
     });
     return () => { cancelled = true; };
@@ -1050,3 +1048,4 @@ const styles = {
   loading: { padding: 40, textAlign: "center", color: "#a8b8cc", fontSize: 12 },
   chartEmpty: { height: 150, display: "flex", alignItems: "center", justifyContent: "center", color: "#a8b8cc", fontSize: 10, fontStyle: "italic" },
 };
+

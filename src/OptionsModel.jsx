@@ -35,7 +35,7 @@ function normPDF(x){ return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI); }
 function bs(S, K, T, r, sigma, type="call") {
   if(T<=0) {
     const intrinsic = type==="call" ? Math.max(S-K,0) : Math.max(K-S,0);
-    return { price: intrinsic, delta: type==="call"?(S>K?1:0):(S<K?-1:0), gamma:0, vega:0, theta:0, charm:0, vomma:0 };
+    return { price: intrinsic, delta: type==="call"?(S>K?1:0):(S<K?-1:0), gamma:0, vega:0, theta:0, charm:0, vomma:0, rho:0 };
   }
   const d1 = (Math.log(S/K)+(r+0.5*sigma*sigma)*T)/(sigma*Math.sqrt(T));
   const d2 = d1 - sigma*Math.sqrt(T);
@@ -53,12 +53,15 @@ function bs(S, K, T, r, sigma, type="call") {
   const gamma = nd1/(S*sigma*Math.sqrt(T));
   const vega = S*nd1*Math.sqrt(T)/100; // per 1 vol point
   const theta = (-(S*nd1*sigma)/(2*Math.sqrt(T)) - r*K*Math.exp(-r*T)*(type==="call"?Nd2:1-Nd2))/365;
+  const rho = type==="call"
+    ? (K*T*Math.exp(-r*T)*Nd2)/100
+    : (-K*T*Math.exp(-r*T)*normCDF(-d2))/100;
   const charm = type==="call"
     ? -nd1*(2*r*T - d2*sigma*Math.sqrt(T))/(2*T*sigma*Math.sqrt(T))
     : nd1*(2*r*T - d2*sigma*Math.sqrt(T))/(2*T*sigma*Math.sqrt(T));
   const vomma = vega*(d1*d2/sigma);
   
-  return { price, delta, gamma, vega, theta, charm, vomma, d1, d2, Nd1, Nd2 };
+  return { price, delta, gamma, vega, theta, rho, charm, vomma, d1, d2, Nd1, Nd2 };
 }
 
 function computeIV(price, S, K, T, r, type, tol=0.0001, maxIter=200) {
@@ -514,6 +517,10 @@ export default function OptionsModel({ loadedTicker = null }) {
   const [activeTab, setActiveTab] = useState("overview");
   const [volShift, setVolShift] = useState(0);
   const [spotShift, setSpotShift] = useState(0);
+  const [labSpotShift, setLabSpotShift] = useState(0);
+  const [labVolShift, setLabVolShift] = useState(0);
+  const [labDaysForward, setLabDaysForward] = useState(0);
+  const [labRateShiftBps, setLabRateShiftBps] = useState(0);
   const [margin, setMargin] = useState(20); // % of notional
   const [nextId, setNextId] = useState(10);
   // Vol surface: array of {id, strike, dte, iv, type} data points from Fidelity chain
@@ -720,6 +727,7 @@ export default function OptionsModel({ loadedTicker = null }) {
     const gamma = portfolio.reduce((s,l,i) => s + l.gamma * processedLegs[i].qty * (processedLegs[i].dir==="long"?1:-1) * 100, 0);
     const vega  = portfolio.reduce((s,l,i) => s + l.vega  * processedLegs[i].qty * (processedLegs[i].dir==="long"?1:-1) * 100, 0);
     const theta = portfolio.reduce((s,l,i) => s + l.theta * processedLegs[i].qty * (processedLegs[i].dir==="long"?1:-1) * 100, 0);
+    const rho   = portfolio.reduce((s,l,i) => s + (l.rho||0) * processedLegs[i].qty * (processedLegs[i].dir==="long"?1:-1) * 100, 0);
     const charm = portfolio.reduce((s,l,i) => s + (l.charm||0) * processedLegs[i].qty * (processedLegs[i].dir==="long"?1:-1) * 100, 0);
     const vomma = portfolio.reduce((s,l,i) => s + (l.vomma||0) * processedLegs[i].qty * (processedLegs[i].dir==="long"?1:-1) * 100, 0);
     const avgIV = processedLegs.reduce((s,l)=>s+(l.iv||25),0)/processedLegs.length;
@@ -730,7 +738,7 @@ export default function OptionsModel({ loadedTicker = null }) {
     const notional = spot * 100;
     const marginReq = notional * (margin/100);
     const retOnMargin = totalCost > 0 ? 0 : (-totalCost / marginReq) * 100;
-    return { totalCost, delta, gamma, vega, theta, charm, vomma, avgIV, vrp, breakEvenRV, maxLoss, maxGain, notional, marginReq, retOnMargin };
+    return { totalCost, delta, gamma, vega, theta, rho, charm, vomma, avgIV, vrp, breakEvenRV, maxLoss, maxGain, notional, marginReq, retOnMargin };
   }, [portfolio, processedLegs, spot, T, rf, rv20, margin]);
 
   // Dynamic time slices: Today + 3 equal quarters + At Expiry
@@ -850,6 +858,7 @@ export default function OptionsModel({ loadedTicker = null }) {
       gamma: +(g.gamma*l.qty*sign*100).toFixed(4),
       vega:  +(g.vega *l.qty*sign*100).toFixed(2),
       theta: +(g.theta*l.qty*sign*100).toFixed(2),
+      rho:   +((g.rho||0)*l.qty*sign*100).toFixed(3),
       charm: +((g.charm||0)*l.qty*sign*100).toFixed(4),
       vomma: +((g.vomma||0)*l.qty*sign*100).toFixed(4),
     };
@@ -1006,12 +1015,217 @@ export default function OptionsModel({ loadedTicker = null }) {
     return pnl;
   }, [processedLegs, spot, spotShift, volShift, T, rf]);
 
+  // ——— Position Lab analytics ———————————————————————————————————————————————————
+  const evalPositionScenario = useCallback((spotPct = 0, volPts = 0, daysForward = 0, rateShiftBps = 0) => {
+    const scenarioSpot = spot * (1 + spotPct / 100);
+    const scenarioT = Math.max(T - daysForward / 365, 0.001);
+    const scenarioRf = Math.max(-0.05, rf + rateShiftBps / 10000);
+    let entryValue = 0;
+    let currentValue = 0;
+    let intrinsicValue = 0;
+    let extrinsicValue = 0;
+    let delta = 0, gamma = 0, theta = 0, vega = 0, rho = 0;
+
+    processedLegs.forEach((l) => {
+      const strike = spot * (l.strikePct / 100);
+      const entryIV = (l.baseIV != null ? l.baseIV : l.iv) / 100;
+      const scenarioIV = Math.max(0.001, entryIV + volPts / 100);
+      const sign = l.dir === "long" ? 1 : -1;
+      const mult = l.qty * sign * 100;
+
+      const entry = bs(spot, strike, T, rf, entryIV, l.type);
+      const current = bs(scenarioSpot, strike, scenarioT, scenarioRf, scenarioIV, l.type);
+      const intrinsicPx = l.type === "call" ? Math.max(scenarioSpot - strike, 0) : Math.max(strike - scenarioSpot, 0);
+
+      entryValue += entry.price * mult;
+      currentValue += current.price * mult;
+      intrinsicValue += intrinsicPx * mult;
+      extrinsicValue += (current.price - intrinsicPx) * mult;
+      delta += current.delta * mult;
+      gamma += current.gamma * mult;
+      theta += current.theta * mult;
+      vega += current.vega * mult;
+      rho += (current.rho || 0) * mult;
+    });
+
+    const pnl = currentValue - entryValue;
+    return {
+      scenarioSpot,
+      scenarioT,
+      scenarioRf,
+      scenarioRfPct: scenarioRf * 100,
+      entryValue,
+      currentValue,
+      pnl,
+      intrinsicValue,
+      extrinsicValue,
+      delta,
+      gamma,
+      theta,
+      vega,
+      rho,
+    };
+  }, [processedLegs, spot, T, rf]);
+
+  const payoffAtExpiry = useMemo(() => generatePnLCurve(processedLegs, spot, T, rf, dte, 0), [processedLegs, spot, T, rf, dte]);
+
+  const labBreakEven = useMemo(() => {
+    if (!payoffAtExpiry || payoffAtExpiry.length < 2) return null;
+    for (let i = 1; i < payoffAtExpiry.length; i++) {
+      const p0 = payoffAtExpiry[i - 1];
+      const p1 = payoffAtExpiry[i];
+      if (p0.pnl === 0) return p0.spot;
+      if ((p0.pnl < 0 && p1.pnl > 0) || (p0.pnl > 0 && p1.pnl < 0)) {
+        const w = Math.abs(p0.pnl) / (Math.abs(p0.pnl) + Math.abs(p1.pnl));
+        return +(p0.spot + (p1.spot - p0.spot) * w).toFixed(2);
+      }
+    }
+    return null;
+  }, [payoffAtExpiry]);
+
+  const positionNow = useMemo(() => evalPositionScenario(0, 0, 0, 0), [evalPositionScenario]);
+
+  const priceSensitivityRows = useMemo(() => {
+    return [-30, -20, -10, -5, 0, 5, 10, 20, 30].map((pct) => {
+      const s = evalPositionScenario(pct, 0, 0, 0);
+      return {
+        priceChange: pct,
+        underlying: +s.scenarioSpot.toFixed(2),
+        optionPrice: +(s.currentValue / 100).toFixed(2),
+        positionValue: +s.currentValue.toFixed(2),
+        pnl: +s.pnl.toFixed(2),
+      };
+    });
+  }, [evalPositionScenario]);
+
+  const timeDecayRows = useMemo(() => {
+    const days = [...new Set([0, 7, 14, 30, 60, dte].filter((x) => x <= dte))].sort((a, b) => a - b);
+    return days.map((day) => {
+      const s = evalPositionScenario(0, 0, day, 0);
+      return {
+        daysForward: day,
+        optionPrice: +(s.currentValue / 100).toFixed(2),
+        positionValue: +s.currentValue.toFixed(2),
+        pnl: +s.pnl.toFixed(2),
+      };
+    });
+  }, [evalPositionScenario, dte]);
+
+  const ivSensitivityRows = useMemo(() => {
+    return [-20, -10, -5, 0, 5, 10, 20].map((ivShift) => {
+      const s = evalPositionScenario(0, ivShift, 0, 0);
+      return {
+        ivChange: ivShift,
+        ivLevel: +(Math.max(0.1, aggMetrics.avgIV + ivShift)).toFixed(2),
+        optionPrice: +(s.currentValue / 100).toFixed(2),
+        positionValue: +s.currentValue.toFixed(2),
+        pnl: +s.pnl.toFixed(2),
+      };
+    });
+  }, [evalPositionScenario, aggMetrics.avgIV]);
+
+  const heatmapPriceShifts = useMemo(() => [-20, -10, 0, 10, 20], []);
+  const heatmapDays = useMemo(() => [...new Set([0, 7, 14, 30, 60].filter((x) => x <= dte))].sort((a, b) => a - b), [dte]);
+  const priceTimeHeatmapRows = useMemo(() => {
+    return heatmapPriceShifts.map((pct) => {
+      const row = { priceChange: pct };
+      heatmapDays.forEach((day) => {
+        row[`d${day}`] = +evalPositionScenario(pct, 0, day, 0).pnl.toFixed(2);
+      });
+      return row;
+    });
+  }, [evalPositionScenario, heatmapDays, heatmapPriceShifts]);
+
+  const heatmapRange = useMemo(() => {
+    const vals = priceTimeHeatmapRows.flatMap((r) => heatmapDays.map((d) => r[`d${d}`]));
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    return { min: Number.isFinite(min) ? min : 0, max: Number.isFinite(max) ? max : 0 };
+  }, [priceTimeHeatmapRows, heatmapDays]);
+
+  const greekExposureRows = useMemo(() => {
+    return [-10, 0, 10].map((pct) => {
+      const s = evalPositionScenario(pct, 0, 0, 0);
+      return {
+        priceMove: pct,
+        delta: +s.delta.toFixed(3),
+        gamma: +s.gamma.toFixed(4),
+        theta: +s.theta.toFixed(2),
+        vega: +s.vega.toFixed(2),
+        rho: +s.rho.toFixed(3),
+      };
+    });
+  }, [evalPositionScenario]);
+
+  const labScenario = useMemo(() => {
+    return evalPositionScenario(labSpotShift, labVolShift, labDaysForward, labRateShiftBps);
+  }, [evalPositionScenario, labSpotShift, labVolShift, labDaysForward, labRateShiftBps]);
+
+  const strategyAggregationRows = useMemo(() => {
+    return processedLegs.map((l) => {
+      const strike = spot * (l.strikePct / 100);
+      const sigma = (l.baseIV != null ? l.baseIV : l.iv) / 100;
+      const px = bs(spot, strike, T, rf, sigma, l.type).price;
+      return {
+        id: l.id,
+        leg: `${l.dir === "long" ? "L" : "S"}${l.qty}`,
+        type: l.type.toUpperCase(),
+        strike: +strike.toFixed(2),
+        exp: expiryDate,
+        qty: l.qty,
+        price: +px.toFixed(2),
+      };
+    });
+  }, [processedLegs, spot, T, rf, expiryDate]);
+
+  const probabilityRows = useMemo(() => {
+    const shifts = [-20, -10, 0, 10, 20];
+    const sigma = Math.max(0.01, aggMetrics.avgIV / 100);
+    if (T <= 0) {
+      return shifts.map((shift) => {
+        const snap = evalPositionScenario(shift, 0, 0, 0);
+        return { shift, probability: shift === 0 ? 1 : 0, pnl: +snap.pnl.toFixed(2) };
+      });
+    }
+    const mu = Math.log(spot) + (rf - 0.5 * sigma * sigma) * T;
+    const sd = sigma * Math.sqrt(T);
+    const levels = shifts.map((s) => spot * (1 + s / 100));
+    const boundaries = [0];
+    for (let i = 0; i < levels.length - 1; i++) boundaries.push((levels[i] + levels[i + 1]) / 2);
+    boundaries.push(Infinity);
+
+    const rows = shifts.map((shift, i) => {
+      const lo = boundaries[i];
+      const hi = boundaries[i + 1];
+      const zLo = lo <= 0 ? -Infinity : (Math.log(lo) - mu) / sd;
+      const zHi = hi === Infinity ? Infinity : (Math.log(hi) - mu) / sd;
+      const probability = Math.max(0, normCDF(zHi) - normCDF(zLo));
+      const snap = evalPositionScenario(shift, 0, 0, 0);
+      return { shift, probability, pnl: +snap.pnl.toFixed(2) };
+    });
+    return rows;
+  }, [aggMetrics.avgIV, T, spot, rf, evalPositionScenario]);
+
+  const probabilityExpectedPnl = useMemo(() => {
+    return probabilityRows.reduce((s, r) => s + r.probability * r.pnl, 0);
+  }, [probabilityRows]);
+
   // ─── UI HELPERS ─────────────────────────────────────────────────────────
   const fmtPnl = v => (v>=0?"+":"")+v.toFixed(2);
   const fmtPct = v => (v>=0?"+":"")+v.toFixed(1)+"%";
   const clr = v => v>=0?"#00875a":"#c0182e";
 
-  const TABS = ["overview","pnl","vol","greeks","scenarios","capital","surface"];
+  const TABS = ["overview","positionlab","pnl","vol","greeks","scenarios","capital","surface"];
+  const TAB_LABELS = {
+    overview: "overview",
+    positionlab: "position lab",
+    pnl: "p&l",
+    vol: "vol",
+    greeks: "greeks",
+    scenarios: "scenarios",
+    capital: "capital",
+    surface: "surface",
+  };
   
   const addLeg = () => {
     setLegs(prev=>[...prev, { id:nextId, type:"call", dir:"long", qty:1, strikePct:100, iv:25, bidPrice: null, askPrice: null }]);
@@ -1314,7 +1528,7 @@ export default function OptionsModel({ loadedTicker = null }) {
       {/* Tabs */}
       <div style={{background:"#ffffff", borderBottom:"1px solid #dde3eb", padding:"0 24px", display:"flex"}}>
         {TABS.map(t=>(
-          <button key={t} className={`tab-btn ${activeTab===t?"active":""}`} onClick={()=>setActiveTab(t)}>{t}</button>
+          <button key={t} className={`tab-btn ${activeTab===t?"active":""}`} onClick={()=>setActiveTab(t)}>{TAB_LABELS[t] || t}</button>
         ))}
       </div>
 
@@ -1430,6 +1644,187 @@ export default function OptionsModel({ loadedTicker = null }) {
         )}
 
         {/* ── P&L TAB ── */}
+        
+        {/* POSITION LAB TAB */}
+        {activeTab==="positionlab" && (
+          <div style={{display:"grid", gridTemplateColumns:"1fr", gap:16}}>
+            <div className="metric-card">
+              <div className="section-title">Position Summary</div>
+              <div className="grid-4">
+                {[
+                  { l: "Underlying (S)", v: positionNow.scenarioSpot.toFixed(2), c: "#0055a5" },
+                  { l: "Days to Expiry", v: `${dte}d`, c: "#1a2332" },
+                  { l: "Current Option Price (net)", v: (positionNow.currentValue/100).toFixed(2), c: "#0055a5" },
+                  { l: "Position Market Value", v: positionNow.currentValue.toFixed(2), c: "#0055a5" },
+                  { l: "Unrealized P&L", v: fmtPnl(positionNow.pnl), c: clr(positionNow.pnl) },
+                  { l: "Break-even (approx)", v: labBreakEven != null ? labBreakEven.toFixed(2) : "�", c: "#c05a00" },
+                  { l: "Intrinsic Value", v: positionNow.intrinsicValue.toFixed(2), c: "#00875a" },
+                  { l: "Extrinsic Value", v: positionNow.extrinsicValue.toFixed(2), c: "#c05a00" },
+                ].map((m) => (
+                  <div key={m.l} style={{padding:10, background:"#f0f2f5", borderRadius:4, border:"1px solid #dde3eb"}}>
+                    <div style={{fontSize:9, color:"#5a6e85"}}>{m.l}</div>
+                    <div style={{fontSize:14, fontWeight:700, color:m.c, marginTop:2}}>{m.v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16}}>
+              <div className="metric-card">
+                <div className="section-title">Price Sensitivity Table</div>
+                <table style={{width:"100%", borderCollapse:"collapse", fontSize:10}}>
+                  <thead>
+                    <tr style={{borderBottom:"1px solid #dde3eb"}}>
+                      {["Price Change","Underlying","Option Price","Position Value","P&L"].map((h)=><th key={h} style={{padding:"4px 6px", textAlign:"right", color:"#5a6e85"}}>{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {priceSensitivityRows.map((r) => (
+                      <tr key={r.priceChange} style={{background:`${r.pnl>=0?"#edf9f4":"#fdeff1"}`}}>
+                        <td style={{padding:"4px 6px",textAlign:"right"}}>{r.priceChange>0?`+${r.priceChange}%`:`${r.priceChange}%`}</td>
+                        <td style={{padding:"4px 6px",textAlign:"right"}}>{r.underlying.toFixed(2)}</td>
+                        <td style={{padding:"4px 6px",textAlign:"right"}}>{r.optionPrice.toFixed(2)}</td>
+                        <td style={{padding:"4px 6px",textAlign:"right"}}>{r.positionValue.toFixed(2)}</td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontWeight:700,color:clr(r.pnl)}}>{fmtPnl(r.pnl)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="metric-card">
+                <div className="section-title">P&L vs Price (Today)</div>
+                <ResponsiveContainer width="100%" height={220}>
+                  <LineChart data={priceSensitivityRows}>
+                    <CartesianGrid strokeDasharray="2 2" stroke="#dde3eb"/>
+                    <XAxis dataKey="underlying" tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <YAxis tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <Tooltip/>
+                    <ReferenceLine y={0} stroke="#8a9eb5"/>
+                    <Line type="monotone" dataKey="pnl" stroke="#0055a5" strokeWidth={2} dot={false}/>
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16}}>
+              <div className="metric-card">
+                <div className="section-title">Time Decay</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <AreaChart data={timeDecayRows}>
+                    <CartesianGrid strokeDasharray="2 2" stroke="#dde3eb"/>
+                    <XAxis dataKey="daysForward" tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <YAxis tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <Tooltip/>
+                    <ReferenceLine y={0} stroke="#8a9eb5"/>
+                    <Area type="monotone" dataKey="pnl" stroke="#c05a00" fill="#fff4e5" strokeWidth={2}/>
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="metric-card">
+                <div className="section-title">IV Sensitivity</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <LineChart data={ivSensitivityRows}>
+                    <CartesianGrid strokeDasharray="2 2" stroke="#dde3eb"/>
+                    <XAxis dataKey="ivChange" tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <YAxis tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <Tooltip/>
+                    <ReferenceLine y={0} stroke="#8a9eb5"/>
+                    <Line type="monotone" dataKey="pnl" stroke="#006b44" strokeWidth={2} dot={false}/>
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16}}>
+              <div className="metric-card">
+                <div className="section-title">Price vs Time Heatmap</div>
+                <table style={{width:"100%", borderCollapse:"separate", borderSpacing:4, fontSize:10}}>
+                  <thead>
+                    <tr>
+                      <th style={{textAlign:"right", color:"#5a6e85"}}>Price \\ Days</th>
+                      {heatmapDays.map((d)=><th key={d} style={{textAlign:"center", color:"#5a6e85"}}>{d}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {priceTimeHeatmapRows.map((r) => (
+                      <tr key={r.priceChange}>
+                        <td style={{textAlign:"right", color:"#1a2332", fontWeight:700, paddingRight:6}}>{r.priceChange>0?`+${r.priceChange}%`:`${r.priceChange}%`}</td>
+                        {heatmapDays.map((d) => {
+                          const v = r[`d${d}`];
+                          const min = heatmapRange.min;
+                          const max = heatmapRange.max;
+                          const t = (v - min) / ((max - min) || 1);
+                          const bg = v >= 0 ? `rgba(0,135,90,${0.15 + 0.65*t})` : `rgba(192,24,46,${0.15 + 0.65*(1-t)})`;
+                          return <td key={d} style={{textAlign:"center", padding:"6px 4px", borderRadius:4, background:bg, color:"#1a2332", fontWeight:700}}>{fmtPnl(v)}</td>;
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="metric-card">
+                <div className="section-title">Payoff Diagram (Expiry)</div>
+                <ResponsiveContainer width="100%" height={220}>
+                  <LineChart data={payoffAtExpiry}>
+                    <CartesianGrid strokeDasharray="2 2" stroke="#dde3eb"/>
+                    <XAxis dataKey="spot" tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <YAxis tick={{fontSize:9, fill:"#5a6e85"}}/>
+                    <Tooltip/>
+                    <ReferenceLine y={0} stroke="#8a9eb5"/>
+                    <ReferenceLine x={spot} stroke="#c5cdd8" strokeDasharray="3 3"/>
+                    {labBreakEven != null && <ReferenceLine x={labBreakEven} stroke="#c05a00" strokeDasharray="3 3"/>}
+                    <Line type="monotone" dataKey="pnl" stroke="#0055a5" dot={false} strokeWidth={2}/>
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16}}>
+              <div className="metric-card">
+                <div className="section-title">Greek Exposure Panel</div>
+                <table style={{width:"100%", borderCollapse:"collapse", fontSize:10}}>
+                  <thead>
+                    <tr style={{borderBottom:"1px solid #dde3eb"}}>{["Price Move","Delta","Gamma","Theta","Vega","Rho"].map((h)=><th key={h} style={{padding:"4px 6px",textAlign:"right",color:"#5a6e85"}}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {greekExposureRows.map((r)=><tr key={r.priceMove}><td style={{padding:"4px 6px",textAlign:"right"}}>{r.priceMove>0?`+${r.priceMove}%`:`${r.priceMove}%`}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.delta.toFixed(3)}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.gamma.toFixed(4)}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.theta.toFixed(2)}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.vega.toFixed(2)}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.rho.toFixed(3)}</td></tr>)}
+                  </tbody>
+                </table>
+              </div>
+              <div className="metric-card">
+                <div className="section-title">Scenario Builder</div>
+                <div className="grid-2">
+                  <div><div style={{fontSize:9,color:"#5a6e85"}}>Underlying Shift %</div><input type="range" min={-30} max={30} value={labSpotShift} onChange={(e)=>setLabSpotShift(+e.target.value)} style={{width:"100%"}}/></div>
+                  <div><div style={{fontSize:9,color:"#5a6e85"}}>IV Shift pts</div><input type="range" min={-20} max={20} value={labVolShift} onChange={(e)=>setLabVolShift(+e.target.value)} style={{width:"100%"}}/></div>
+                  <div><div style={{fontSize:9,color:"#5a6e85"}}>Days Forward</div><input type="range" min={0} max={Math.max(1,dte)} value={labDaysForward} onChange={(e)=>setLabDaysForward(+e.target.value)} style={{width:"100%"}}/></div>
+                  <div><div style={{fontSize:9,color:"#5a6e85"}}>Rate Shift (bps)</div><input type="range" min={-200} max={200} step={5} value={labRateShiftBps} onChange={(e)=>setLabRateShiftBps(+e.target.value)} style={{width:"100%"}}/></div>
+                </div>
+                <div style={{marginTop:8,fontSize:11,color:"#1a2332"}}>Value: <b>{labScenario.currentValue.toFixed(2)}</b> | P&L: <b style={{color:clr(labScenario.pnl)}}>{fmtPnl(labScenario.pnl)}</b></div>
+              </div>
+            </div>
+
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16}}>
+              <div className="metric-card">
+                <div className="section-title">Strategy Aggregation</div>
+                <table style={{width:"100%", borderCollapse:"collapse", fontSize:10}}>
+                  <thead><tr style={{borderBottom:"1px solid #dde3eb"}}>{["Leg","Type","Strike","Exp","Qty","Price"].map((h)=><th key={h} style={{padding:"4px 6px",textAlign:"right",color:"#5a6e85"}}>{h}</th>)}</tr></thead>
+                  <tbody>{strategyAggregationRows.map((r)=><tr key={r.id}><td style={{padding:"4px 6px",textAlign:"right"}}>{r.leg}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.type}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.strike.toFixed(2)}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.exp.slice(5)}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.qty}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{r.price.toFixed(2)}</td></tr>)}</tbody>
+                </table>
+              </div>
+              <div className="metric-card">
+                <div className="section-title">Probability-weighted P&L</div>
+                <table style={{width:"100%", borderCollapse:"collapse", fontSize:10}}>
+                  <thead><tr style={{borderBottom:"1px solid #dde3eb"}}>{["Price Level","Probability","P&L"].map((h)=><th key={h} style={{padding:"4px 6px",textAlign:"right",color:"#5a6e85"}}>{h}</th>)}</tr></thead>
+                  <tbody>{probabilityRows.map((r)=><tr key={r.shift}><td style={{padding:"4px 6px",textAlign:"right"}}>{r.shift>0?`+${r.shift}%`:`${r.shift}%`}</td><td style={{padding:"4px 6px",textAlign:"right"}}>{(r.probability*100).toFixed(1)}%</td><td style={{padding:"4px 6px",textAlign:"right",fontWeight:700,color:clr(r.pnl)}}>{fmtPnl(r.pnl)}</td></tr>)}</tbody>
+                </table>
+                <div style={{marginTop:10,padding:10,background:"#eef4fb",border:"1px solid #cfe0f5",borderRadius:4}}>
+                  <div style={{fontSize:9,color:"#5a6e85"}}>Expected Value</div>
+                  <div style={{fontSize:16,fontWeight:700,color:clr(probabilityExpectedPnl)}}>{fmtPnl(probabilityExpectedPnl)}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         {activeTab==="pnl" && (
           <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16}}>
             <div>
@@ -2401,6 +2796,7 @@ export default function OptionsModel({ loadedTicker = null }) {
     </div>
   );
 }
+
 
 
 

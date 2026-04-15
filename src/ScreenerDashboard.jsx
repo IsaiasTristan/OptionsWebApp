@@ -12,7 +12,11 @@ import {
   fetchEquityHistory,
   computeRollingRV,
   fetchTickerForModel,
+  clearLatestDateCache,
+  SURFACE_HISTORY_CALENDAR_DAYS,
 } from "./lib/screenerApi.js";
+import { reportError } from "./lib/reportError.js";
+import { isCloudEnabled } from "./lib/supabase.js";
 
 // ── Static maps ───────────────────────────────────────────────────────────────
 
@@ -160,14 +164,23 @@ function TermStructureChart({ symbol, surfaceHistory, chainData }) {
   );
 }
 
-function IVvsRVChart({ symbol, surfaceHistory }) {
+function IVvsRVChart({ symbol, surfaceHistory, dataRefreshKey = 0 }) {
   const [equityRows, setEquityRows] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
-    fetchEquityHistory(symbol, 120).then((rows) => { if (!cancelled) setEquityRows(rows); });
-    return () => { cancelled = true; };
-  }, [symbol]);
+    fetchEquityHistory(symbol, SURFACE_HISTORY_CALENDAR_DAYS + 60)
+      .then((rows) => {
+        if (!cancelled) setEquityRows(rows);
+      })
+      .catch((e) => {
+        reportError(`IVvsRVChart fetchEquityHistory(${symbol})`, e);
+        if (!cancelled) setEquityRows([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol, dataRefreshKey]);
 
   const { data, rvDays } = useMemo(() => {
     const ivData = surfaceHistory
@@ -399,21 +412,15 @@ function HeatmapGrid({ chainData }) {
 
 // ── Tab 1: Universe Screener ──────────────────────────────────────────────────
 
-function UniverseTab({ asOfDate, onLoadTicker }) {
-  const [data, setData]           = useState([]);
-  const [loading, setLoading]     = useState(true);
-  const [sortKey, setSortKey]     = useState("composite_score");
-  const [sortDir, setSortDir]     = useState("desc");
+function UniverseTab({ asOfDate, rows: data, loading, loadErrors, onLoadTicker }) {
+  const [sortKey, setSortKey] = useState("composite_score");
+  const [sortDir, setSortDir] = useState("desc");
   const [sectorFilter, setSectorFilter] = useState("all");
-  const [search, setSearch]       = useState("");
+  const [search, setSearch] = useState("");
   const [loadingTicker, setLoadingTicker] = useState(null);
 
-  useEffect(() => {
-    fetchUniverseData().then(({ rows }) => { setData(rows); setLoading(false); });
-  }, []);
-
   const sorted = useMemo(() => {
-    let rows = [...data];
+    let rows = [...(data || [])];
     if (sectorFilter !== "all") rows = rows.filter((r) => r.sector === sectorFilter);
     if (search) rows = rows.filter((r) => r.symbol.includes(search.toUpperCase()));
     rows.sort((a, b) => {
@@ -449,6 +456,44 @@ function UniverseTab({ asOfDate, onLoadTicker }) {
 
   return (
     <div>
+      {loadErrors && loadErrors.length > 0 && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: "10px 12px",
+            borderRadius: 6,
+            fontSize: 11,
+            lineHeight: 1.45,
+            background: "#fff0dc",
+            border: "1px solid #c05a0044",
+            color: "#5a3e00",
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>Data connection</div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {loadErrors.map((msg, i) => (
+              <li key={i}>{msg}</li>
+            ))}
+          </ul>
+          <div style={{ marginTop: 8, fontSize: 10, color: "#7a6a55" }}>
+            {loadErrors.some((msg) => /failed to fetch|networkerror|load failed/i.test(String(msg))) ? (
+              <>
+                <strong>“Failed to fetch”</strong> is usually <strong>network or browser blocking</strong>, not RLS. Check: correct{" "}
+                <code style={{ fontSize: 10 }}>https://…supabase.co</code> URL (no trailing slash), project not paused in Supabase dashboard, ad
+                blockers disabled for localhost, then run <code style={{ fontSize: 10 }}>npm run verify:supabase</code> (see{" "}
+                <code style={{ fontSize: 10 }}>SUPABASE_SETUP.md</code> §7).
+              </>
+            ) : (
+              <>
+                Tip: open the browser devtools console for <code style={{ fontSize: 10 }}>[OPTIX]</code> lines. Confirm RLS allows{" "}
+                <code style={{ fontSize: 10 }}>anon</code> SELECT on <code style={{ fontSize: 10 }}>tickers</code>,{" "}
+                <code style={{ fontSize: 10 }}>vol_surfaces</code>, and <code style={{ fontSize: 10 }}>screener_output</code> (see{" "}
+                <code style={{ fontSize: 10 }}>SUPABASE_SETUP.md</code>).
+              </>
+            )}
+          </div>
+        </div>
+      )}
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
         <input value={search} onChange={(e) => setSearch(e.target.value)}
           placeholder="Search symbol…"
@@ -537,7 +582,7 @@ function UniverseTab({ asOfDate, onLoadTicker }) {
                 </td>
                 <td style={{ ...styles.td, fontWeight: 700, color: "#0055a5" }}>{fmt(row.composite_score, 1)}</td>
                 <td style={styles.td}>
-                  {row.flags.map((f) => {
+                  {(row.flags || []).map((f) => {
                     const st = FLAG_STYLE[f];
                     return st ? (
                       <span key={f} style={{ fontSize: 8, fontWeight: 700, padding: "1px 5px", borderRadius: 3, marginRight: 3, background: st.bg, color: st.color }}>
@@ -564,17 +609,29 @@ const CHART_TYPES = [
   { id: "heatmap", label: "Vol Heatmap" },
 ];
 
-function TickerCard({ symbol, sector, chartType, surfaceHistory, onLoadTicker }) {
+function TickerCard({ symbol, sector, chartType, surfaceHistory, onLoadTicker, dataRefreshKey = 0 }) {
   const [chainData, setChainData]   = useState(null);
   const [loadingChain, setLoadingChain] = useState(true);
   const [loadingModel, setLoadingModel] = useState(false);
 
   useEffect(() => {
-    let cancelled = false;    fetchTickerChainToday(symbol).then((data) => {
-      if (!cancelled) { setChainData(data); setLoadingChain(false); }
-    });
-    return () => { cancelled = true; };
-  }, [symbol]);
+    let cancelled = false;
+    setLoadingChain(true);
+    fetchTickerChainToday(symbol)
+      .then((data) => {
+        if (!cancelled) setChainData(data);
+      })
+      .catch((e) => {
+        reportError(`TickerCard fetchTickerChainToday(${symbol})`, e);
+        if (!cancelled) setChainData([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingChain(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol, dataRefreshKey]);
 
   const handleLoad = async () => {
     setLoadingModel(true);
@@ -609,22 +666,31 @@ function TickerCard({ symbol, sector, chartType, surfaceHistory, onLoadTicker })
       </div>
       {isLoading && <div style={styles.chartEmpty}>Loading chain data…</div>}
       {!isLoading && chartType === "term"    && <TermStructureChart symbol={symbol} surfaceHistory={surfaceHistory} chainData={chainData ?? []} />}
-      {chartType === "iv_rv"                 && <IVvsRVChart symbol={symbol} surfaceHistory={surfaceHistory} />}
+      {chartType === "iv_rv"                 && (
+        <IVvsRVChart symbol={symbol} surfaceHistory={surfaceHistory} dataRefreshKey={dataRefreshKey} />
+      )}
       {!isLoading && chartType === "skew"    && <SkewChart chainData={chainData ?? []} />}
       {!isLoading && chartType === "heatmap" && <HeatmapGrid chainData={chainData ?? []} />}
     </div>
   );
 }
 
-function ChartsTab({ tickers, onLoadTicker }) {
+function ChartsTab({ tickers, onLoadTicker, refreshKey: dataRefreshKey = 0 }) {
   const [chartType, setChartType]   = useState("term");
   const [surfaceHistory, setSurfaceHistory] = useState([]);
   const [loading, setLoading]       = useState(true);
   const [sectorFilter, setSectorFilter] = useState("all");
 
   useEffect(() => {
-    fetchSurfaceHistory(90).then((data) => { setSurfaceHistory(data); setLoading(false); });
-  }, []);
+    setLoading(true);
+    fetchSurfaceHistory(SURFACE_HISTORY_CALENDAR_DAYS)
+      .then((data) => setSurfaceHistory(data))
+      .catch((e) => {
+        reportError("ChartsTab fetchSurfaceHistory", e);
+        setSurfaceHistory([]);
+      })
+      .finally(() => setLoading(false));
+  }, [dataRefreshKey]);
 
   const filteredTickers = sectorFilter === "all" ? tickers : tickers.filter((t) => t.sector === sectorFilter);
   const bySector = SECTORS.filter((s) => s !== "all").reduce((acc, sec) => {
@@ -659,11 +725,16 @@ function ChartsTab({ tickers, onLoadTicker }) {
             color: sectorFilter === s ? "#0055a5" : "#5a6e85",
           }}>{s === "all" ? "All" : SECTOR_LABELS[s]}</button>
         ))}
-        {chartType === "iv_rv" && rvDaysHint < 5 && (
-          <div style={{ marginLeft: "auto", fontSize: 9, color: "#c05a00", background: "#fff0dc", padding: "3px 8px", borderRadius: 4 }}>
-            IV line builds daily · RV backfilled from equity price history
-          </div>
-        )}
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {chartType === "iv_rv" && rvDaysHint < 5 && (
+            <div style={{ fontSize: 9, color: "#c05a00", background: "#fff0dc", padding: "3px 8px", borderRadius: 4 }}>
+              IV line builds daily · RV backfilled from equity price history
+            </div>
+          )}
+          <span style={{ fontSize: 9, color: "#5a6e85" }}>
+            Surface history: last {SURFACE_HISTORY_CALENDAR_DAYS} calendar days (each day present in DB in range)
+          </span>
+        </div>
       </div>
       {Object.entries(bySector).map(([sec, group]) => (
         <div key={sec} style={{ marginBottom: 20 }}>
@@ -678,7 +749,8 @@ function ChartsTab({ tickers, onLoadTicker }) {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 10 }}>
             {group.map((t) => (
               <TickerCard key={t.symbol} symbol={t.symbol} sector={t.sector}
-                chartType={chartType} surfaceHistory={surfaceHistory} onLoadTicker={onLoadTicker} />
+                chartType={chartType} surfaceHistory={surfaceHistory} onLoadTicker={onLoadTicker}
+                dataRefreshKey={dataRefreshKey} />
             ))}
           </div>
         </div>
@@ -689,7 +761,7 @@ function ChartsTab({ tickers, onLoadTicker }) {
 
 // ── Tab 3: Volume Anomaly Feed ────────────────────────────────────────────────
 
-function AnomaliesTab() {
+function AnomaliesTab({ refreshKey = 0 }) {
   const [rows, setRows]                 = useState([]);
   const [latestDate, setLatestDate]     = useState(null);
   const [historyDays, setHistoryDays]   = useState(0);
@@ -701,10 +773,21 @@ function AnomaliesTab() {
   const [sortDir, setSortDir]           = useState("desc");
 
   useEffect(() => {
-    fetchVolumeAnomalyFeed(500).then(({ rows: r, latestDate: d, historyDays: h }) => {
-      setRows(r); setLatestDate(d); setHistoryDays(h); setLoading(false);
-    });
-  }, []);
+    setLoading(true);
+    fetchVolumeAnomalyFeed(500)
+      .then(({ rows: r, latestDate: d, historyDays: h }) => {
+        setRows(r);
+        setLatestDate(d);
+        setHistoryDays(h);
+      })
+      .catch((e) => {
+        reportError("AnomaliesTab fetchVolumeAnomalyFeed", e);
+        setRows([]);
+        setLatestDate(null);
+        setHistoryDays(0);
+      })
+      .finally(() => setLoading(false));
+  }, [refreshKey]);
 
   const filtered = useMemo(() => {
     let r = rows.filter((x) => (x.volume ?? 0) >= minVol);
@@ -849,14 +932,21 @@ function StatusIcon({ severity }) {
   return <span title="Warning" style={{ fontSize: 16 }}>⚠️</span>;
 }
 
-function QCTab() {
+function QCTab({ refreshKey = 0 }) {
   const [rows, setRows]         = useState([]);
   const [loading, setLoading]   = useState(true);
   const [expanded, setExpanded] = useState(null);
 
   useEffect(() => {
-    fetchDataQC().then((data) => { setRows(data); setLoading(false); });
-  }, []);
+    setLoading(true);
+    fetchDataQC()
+      .then((data) => setRows(data))
+      .catch((e) => {
+        reportError("QCTab fetchDataQC", e);
+        setRows([]);
+      })
+      .finally(() => setLoading(false));
+  }, [refreshKey]);
 
   const sorted = useMemo(() =>
     [...rows].sort((a, b) => {
@@ -997,15 +1087,41 @@ const TABS = [
 
 export default function ScreenerDashboard({ onBack, onLoadTicker }) {
   const [activeTab, setActiveTab] = useState("universe");
-  const [tickers, setTickers]     = useState([]);
-  const [asOfDate, setAsOfDate]   = useState(null);
+  const [tickers, setTickers] = useState([]);
+  const [asOfDate, setAsOfDate] = useState(null);
+  const [universeRows, setUniverseRows] = useState([]);
+  const [universeLoading, setUniverseLoading] = useState(true);
+  const [universeErrors, setUniverseErrors] = useState([]);
+  const [dataRefreshKey, setDataRefreshKey] = useState(0);
 
   useEffect(() => {
-    fetchUniverseData().then(({ rows, asOfDate }) => {
-      setTickers(rows.map((r) => ({ symbol: r.symbol, sector: r.sector })));
-      setAsOfDate(asOfDate);
-    });
-  }, []);
+    if (!isCloudEnabled()) {
+      setUniverseRows([]);
+      setTickers([]);
+      setAsOfDate(null);
+      setUniverseErrors([
+        "Supabase is not configured. Copy .env.example to .env, set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your real project values (not the placeholder text), then restart npm run dev.",
+      ]);
+      setUniverseLoading(false);
+      return;
+    }
+    setUniverseLoading(true);
+    fetchUniverseData()
+      .then(({ rows, asOfDate: ad, errors }) => {
+        setUniverseRows(rows);
+        setTickers(rows.map((r) => ({ symbol: r.symbol, sector: r.sector })));
+        setAsOfDate(ad);
+        setUniverseErrors(errors && errors.length ? errors : []);
+      })
+      .catch((e) => {
+        reportError("ScreenerDashboard fetchUniverseData", e);
+        setUniverseRows([]);
+        setTickers([]);
+        setAsOfDate(null);
+        setUniverseErrors([`Request failed: ${e instanceof Error ? e.message : String(e)}`]);
+      })
+      .finally(() => setUniverseLoading(false));
+  }, [dataRefreshKey]);
 
   const handleLoad = useCallback((tickerData) => {
     if (onLoadTicker) onLoadTicker(tickerData);
@@ -1018,7 +1134,30 @@ export default function ScreenerDashboard({ onBack, onLoadTicker }) {
           ← Options Model
         </button>
         <div style={{ fontWeight: 700, fontSize: 14, color: "#ffffff", letterSpacing: "0.05em" }}>VOL SCREENER</div>
-        <div style={{ fontSize: 9, color: "#4a9eff", letterSpacing: "0.1em" }}>{asOfDate ? `DATA: ${asOfDate}` : "LOADING…"}</div>
+        <div style={{ fontSize: 9, color: "#4a9eff", letterSpacing: "0.1em" }}>
+          {universeLoading ? "LOADING…" : asOfDate ? `DATA: ${asOfDate}` : "NO PIPELINE DATE"}
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            clearLatestDateCache();
+            setDataRefreshKey((k) => k + 1);
+          }}
+          disabled={universeLoading || !isCloudEnabled()}
+          style={{
+            padding: "3px 10px",
+            fontSize: 9,
+            fontWeight: 700,
+            borderRadius: 4,
+            cursor: universeLoading || !isCloudEnabled() ? "default" : "pointer",
+            border: "1px solid #3a4a60",
+            background: "#243044",
+            color: "#a8b8cc",
+            opacity: universeLoading || !isCloudEnabled() ? 0.5 : 1,
+          }}
+        >
+          Refresh data
+        </button>
         <div style={{ marginLeft: "auto", fontSize: 9, color: "#3a4a60" }}>{tickers.length} active tickers</div>
       </div>
       <div style={{ background: "#fff", borderBottom: "1px solid #dde3eb", padding: "0 20px", display: "flex", gap: 0 }}>
@@ -1033,10 +1172,20 @@ export default function ScreenerDashboard({ onBack, onLoadTicker }) {
         ))}
       </div>
       <div style={{ padding: "16px 20px" }}>
-        {activeTab === "universe"  && <UniverseTab asOfDate={asOfDate} onLoadTicker={handleLoad} />}
-        {activeTab === "charts"    && <ChartsTab tickers={tickers} onLoadTicker={handleLoad} />}
-        {activeTab === "anomalies" && <AnomaliesTab />}
-        {activeTab === "qc"        && <QCTab />}
+        {activeTab === "universe" && (
+          <UniverseTab
+            asOfDate={asOfDate}
+            rows={universeRows}
+            loading={universeLoading}
+            loadErrors={universeErrors}
+            onLoadTicker={handleLoad}
+          />
+        )}
+        {activeTab === "charts"    && (
+          <ChartsTab tickers={tickers} onLoadTicker={handleLoad} refreshKey={dataRefreshKey} />
+        )}
+        {activeTab === "anomalies" && <AnomaliesTab refreshKey={dataRefreshKey} />}
+        {activeTab === "qc"        && <QCTab refreshKey={dataRefreshKey} />}
       </div>
     </div>
   );

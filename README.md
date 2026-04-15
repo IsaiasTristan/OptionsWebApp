@@ -15,10 +15,13 @@ npm install
 npm run dev
 ```
 
+If the Vol Screener shows **Failed to fetch**, confirm `.env` has a real Supabase URL/key, restart the dev server, then run **`npm run verify:supabase`** (Node 20+ loads `.env` automatically). See `SUPABASE_SETUP.md` §7.
+
 ## Build
 
 ```bash
 npm run lint
+npm run test
 npm run build
 npm run preview
 ```
@@ -30,6 +33,13 @@ npm run preview
 - Screener/QC dashboard: `src/ScreenerDashboard.jsx`
 - Data access layer: `src/lib/screenerApi.js`
 - Supabase client and strategy persistence: `src/lib/supabase.js`
+- Domain numerics (framework-agnostic): `src/domain/`
+- Shared market thresholds: `src/lib/marketPolicy.js`
+
+## Project orientation
+
+- **`PROJECT_BRIEF.md`** — living summary of focus, constraints, and major changes.
+- **`AGENTS.md`** — scope and agent/engineering expectations (keep aligned with Cursor user rules).
 
 ## Operating Model
 

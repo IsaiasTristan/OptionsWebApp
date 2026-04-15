@@ -4,14 +4,34 @@
  * Otherwise the app falls back to localStorage (local only).
  */
 import { createClient } from "@supabase/supabase-js";
+import { reportError } from "./reportError.js";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabaseUrlRaw = (import.meta.env.VITE_SUPABASE_URL ?? "").trim();
+const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
 
-export const supabase =
-  supabaseUrl && supabaseAnonKey
-    ? createClient(supabaseUrl, supabaseAnonKey)
-    : null;
+/** Normalize URL so the JS client does not hit malformed endpoints (common cause of Failed to fetch). */
+function normalizeSupabaseUrl(url) {
+  if (!url) return "";
+  let u = url.trim().replace(/\/+$/, "");
+  if (u.startsWith("http://") && u.includes(".supabase.co")) {
+    u = "https://" + u.slice("http://".length);
+  }
+  return u;
+}
+
+const supabaseUrl = normalizeSupabaseUrl(supabaseUrlRaw);
+
+/** Unreplaced .env.example values create a client that always fails — treat as off. */
+function isPlaceholderSupabaseEnv(url, key) {
+  if (!url || !key) return true;
+  if (/your-project-id\.supabase\.co/i.test(url)) return true;
+  if (/^your-anon-key$/i.test(key)) return true;
+  return false;
+}
+
+const envOk = supabaseUrl && supabaseAnonKey && !isPlaceholderSupabaseEnv(supabaseUrl, supabaseAnonKey);
+
+export const supabase = envOk ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
 const TABLE = "strategies";
 
@@ -23,7 +43,7 @@ export async function fetchStrategies() {
     .select("name, snapshot, created_at")
     .order("created_at", { ascending: false });
   if (error) {
-    console.warn("Supabase fetchStrategies error:", error.message);
+    reportError("Supabase fetchStrategies", error);
     return { list: [], error: true };
   }
   const list = (data || []).map((row) => ({
@@ -40,7 +60,7 @@ export async function saveStrategy(name, snapshot) {
   const row = { name, snapshot, updated_at: new Date().toISOString() };
   const { error } = await supabase.from(TABLE).upsert(row, { onConflict: "name" });
   if (error) {
-    console.warn("Supabase saveStrategy error:", error.message);
+    reportError("Supabase saveStrategy", error);
     return false;
   }
   return true;
@@ -51,7 +71,7 @@ export async function deleteStrategy(name) {
   if (!supabase) return false;
   const { error } = await supabase.from(TABLE).delete().eq("name", name);
   if (error) {
-    console.warn("Supabase deleteStrategy error:", error.message);
+    reportError("Supabase deleteStrategy", error);
     return false;
   }
   return true;

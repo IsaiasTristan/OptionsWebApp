@@ -20,179 +20,14 @@ import {
   deleteStrategy,
   isCloudEnabled,
 } from "./lib/supabase.js";
-
-// ─── BLACK-SCHOLES ENGINE ───────────────────────────────────────────────────
-function erf(x) {
-  const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;
-  const sign = x<0?-1:1; x=Math.abs(x);
-  const t=1/(1+p*x);
-  const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
-  return sign*y;
-}
-function normCDF(x){ return 0.5*(1+erf(x/Math.sqrt(2))); }
-function normPDF(x){ return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI); }
-
-function bs(S, K, T, r, sigma, type="call") {
-  if(T<=0) {
-    const intrinsic = type==="call" ? Math.max(S-K,0) : Math.max(K-S,0);
-    return { price: intrinsic, delta: type==="call"?(S>K?1:0):(S<K?-1:0), gamma:0, vega:0, theta:0, charm:0, vomma:0, rho:0 };
-  }
-  const d1 = (Math.log(S/K)+(r+0.5*sigma*sigma)*T)/(sigma*Math.sqrt(T));
-  const d2 = d1 - sigma*Math.sqrt(T);
-  const Nd1 = normCDF(d1), Nd2 = normCDF(d2);
-  const nd1 = normPDF(d1);
-  
-  let price, delta;
-  if(type==="call"){
-    price = S*Nd1 - K*Math.exp(-r*T)*Nd2;
-    delta = Nd1;
-  } else {
-    price = K*Math.exp(-r*T)*normCDF(-d2) - S*normCDF(-d1);
-    delta = Nd1-1;
-  }
-  const gamma = nd1/(S*sigma*Math.sqrt(T));
-  const vega = S*nd1*Math.sqrt(T)/100; // per 1 vol point
-  const theta = (-(S*nd1*sigma)/(2*Math.sqrt(T)) - r*K*Math.exp(-r*T)*(type==="call"?Nd2:1-Nd2))/365;
-  const rho = type==="call"
-    ? (K*T*Math.exp(-r*T)*Nd2)/100
-    : (-K*T*Math.exp(-r*T)*normCDF(-d2))/100;
-  const charm = type==="call"
-    ? -nd1*(2*r*T - d2*sigma*Math.sqrt(T))/(2*T*sigma*Math.sqrt(T))
-    : nd1*(2*r*T - d2*sigma*Math.sqrt(T))/(2*T*sigma*Math.sqrt(T));
-  const vomma = vega*(d1*d2/sigma);
-  
-  return { price, delta, gamma, vega, theta, rho, charm, vomma, d1, d2, Nd1, Nd2 };
-}
-
-function computeIV(price, S, K, T, r, type, tol=0.0001, maxIter=200) {
-  let lo=0.001, hi=5, mid=0.25;
-  for(let i=0;i<maxIter;i++){
-    const p=bs(S,K,T,r,mid,type).price;
-    if(Math.abs(p-price)<tol) return mid;
-    if(p<price) lo=mid; else hi=mid;
-    mid=(lo+hi)/2;
-  }
-  return mid;
-}
-
-// ─── SKEW / TERM STRUCTURE (simplified parametric) ──────────────────────────
-
-// ─── VOL SURFACE ENGINE ──────────────────────────────────────────────────────
-
-// Fit a quadratic in log-moneyness for a single tenor slice
-// returns {a, b, c} such that IV(K) = a + b*m + c*m^2, m = ln(K/S)
-function fitSlice(points, S) {
-  // points = [{strike, iv}], minimum 2 needed (3 for full quadratic)
-  if (!points || points.length === 0) return null;
-  if (points.length === 1) return { a: points[0].iv, b: 0, c: 0 };
-  
-  const ms = points.map(p => Math.log(p.strike / S));
-  const ivs = points.map(p => p.iv);
-  
-  if (points.length === 2) {
-    // Linear fit
-    const dm = ms[1] - ms[0];
-    const b = dm !== 0 ? (ivs[1] - ivs[0]) / dm : 0;
-    const a = ivs[0] - b * ms[0];
-    return { a, b, c: 0 };
-  }
-  
-  // Quadratic least squares (Vandermonde normal equations)
-  let s0=0, s1=0, s2=0, s3=0, s4=0, t0=0, t1=0, t2=0;
-  for (let i=0; i<ms.length; i++) {
-    const m=ms[i], v=ivs[i];
-    s0+=1; s1+=m; s2+=m*m; s3+=m*m*m; s4+=m*m*m*m;
-    t0+=v; t1+=m*v; t2+=m*m*v;
-  }
-  // Solve 3x3 system [s0,s1,s2; s1,s2,s3; s2,s3,s4] * [a,b,c] = [t0,t1,t2]
-    // Use simple matrix inverse for 3x3
-  const M = [[s0,s1,s2],[s1,s2,s3],[s2,s3,s4]];
-  const T = [t0,t1,t2];
-  // Gaussian elimination
-  for (let col=0; col<3; col++) {
-    let maxRow=col;
-    for (let row=col+1; row<3; row++) if (Math.abs(M[row][col])>Math.abs(M[maxRow][col])) maxRow=row;
-    [M[col],M[maxRow]]=[M[maxRow],M[col]]; [T[col],T[maxRow]]=[T[maxRow],T[col]];
-    for (let row=col+1; row<3; row++) {
-      const f = M[col][col]!==0 ? M[row][col]/M[col][col] : 0;
-      for (let k=col; k<3; k++) M[row][k]-=f*M[col][k];
-      T[row]-=f*T[col];
-    }
-  }
-  const c3 = M[2][2]!==0 ? T[2]/M[2][2] : 0;
-  const c2 = M[1][1]!==0 ? (T[1]-M[1][2]*c3)/M[1][1] : 0;
-  const c1 = M[0][0]!==0 ? (T[0]-M[0][1]*c2-M[0][2]*c3)/M[0][0] : 0;
-  return { a: c1, b: c2, c: c3 };
-}
-
-// Interpolate IV from fitted surface at given strike and DTE
-function surfaceIV(surfacePoints, S, strike, targetDte) {
-  if (!surfacePoints || surfacePoints.length === 0) return null;
-  
-  // Group points by tenor
-  const tenorMap = {};
-  surfacePoints.forEach(p => {
-    const k = p.dte;
-    if (!tenorMap[k]) tenorMap[k] = [];
-    tenorMap[k].push(p);
-  });
-  const tenors = Object.keys(tenorMap).map(Number).sort((a,b)=>a-b);
-  if (tenors.length === 0) return null;
-  
-  // Fit each slice
-  const fits = tenors.map(t => ({ dte: t, fit: fitSlice(tenorMap[t], S) }));
-  
-  // Evaluate IV at this strike for each fitted tenor
-  const m = Math.log(strike / S);
-  const evalAt = (fit) => fit ? Math.max(0.5, fit.a + fit.b*m + fit.c*m*m) : null;
-  
-  // If only one tenor, just use it
-  if (fits.length === 1) return evalAt(fits[0].fit);
-  
-  // Find bracketing tenors and interpolate linearly in sqrt(T) space
-  if (targetDte <= tenors[0]) return evalAt(fits[0].fit);
-  if (targetDte >= tenors[tenors.length-1]) return evalAt(fits[fits.length-1].fit);
-  
-  let lo = fits[0], hi = fits[1];
-  for (let i=0; i<fits.length-1; i++) {
-    if (fits[i].dte <= targetDte && fits[i+1].dte >= targetDte) { lo=fits[i]; hi=fits[i+1]; break; }
-  }
-  
-  // Interpolate in sqrt(T) (variance time) space
-  const sqLo = Math.sqrt(lo.dte), sqHi = Math.sqrt(hi.dte), sqT = Math.sqrt(targetDte);
-  const wHi = sqHi > sqLo ? (sqT - sqLo) / (sqHi - sqLo) : 0;
-  const wLo = 1 - wHi;
-  const ivLo = evalAt(lo.fit), ivHi = evalAt(hi.fit);
-  if (ivLo == null || ivHi == null) return ivLo ?? ivHi;
-  return wLo * ivLo + wHi * ivHi;
-}
-
-
-// Convert expiry date string → DTE (days from today)
-function expiryToDte(expiryStr) {
-  const today = new Date(); today.setHours(0,0,0,0);
-  const exp   = new Date(expiryStr); exp.setHours(0,0,0,0);
-  return Math.max(1, Math.round((exp - today) / 86400000));
-}
-
-// ─── DYNAMIC RISK-FREE RATE ──────────────────────────────────────────────────
-// Interpolated from a US Treasury yield curve approximation.
-// Update the curve array as market rates change.
-function getRiskFreeRate(dte) {
-  const curve = [
-    [7,   4.30], [30,  4.25], [60,  4.20], [90,  4.15],
-    [180, 4.10], [365, 4.05], [730, 4.00],
-  ];
-  if (dte <= curve[0][0]) return curve[0][1];
-  if (dte >= curve[curve.length - 1][0]) return curve[curve.length - 1][1];
-  for (let i = 0; i < curve.length - 1; i++) {
-    if (dte >= curve[i][0] && dte <= curve[i + 1][0]) {
-      const t = (dte - curve[i][0]) / (curve[i + 1][0] - curve[i][0]);
-      return +(curve[i][1] + t * (curve[i + 1][1] - curve[i][1])).toFixed(3);
-    }
-  }
-  return 4.15;
-}
+import { bs, computeIV, normCDF } from "./domain/blackScholes.js";
+import { surfaceIV, expiryToDte } from "./domain/volSurface.js";
+import { getRiskFreeRate } from "./domain/riskFreeRate.js";
+import { reportError } from "./lib/reportError.js";
+import {
+  normalizeWatchlistSnapshot,
+  normalizeLoadedTickerForModel,
+} from "./lib/watchlistSnapshot.js";
 
 // ─── STRATEGY BUILDER ───────────────────────────────────────────────────────
 function computeLeg(leg, S, T, r) {
@@ -551,28 +386,36 @@ export default function OptionsModel({ loadedTicker = null }) {
   // Pre-populate from Screener when a ticker is loaded via "→ Model"
   useEffect(() => {
     if (!loadedTicker) return;
-    setTicker(loadedTicker.symbol ?? "");
-    if (loadedTicker.spot != null && loadedTicker.spot > 0) setSpot(loadedTicker.spot);
-    if (loadedTicker.surfacePoints && loadedTicker.surfacePoints.length > 0) {
-      setSurfacePoints(loadedTicker.surfacePoints);
+    const t = normalizeLoadedTickerForModel(loadedTicker);
+    if (!t) {
+      reportError("loadedTicker invalid", new Error("normalizeLoadedTickerForModel rejected payload"));
+      return;
+    }
+    setTicker(t.symbol);
+    if (t.spot != null && t.spot > 0) setSpot(t.spot);
+    if (t.surfacePoints && t.surfacePoints.length > 0) {
+      setSurfacePoints(t.surfacePoints);
       setSurfaceEnabled(true);
     }
-    if (loadedTicker.rv20 != null) setRv20(+loadedTicker.rv20.toFixed(1));
+    if (t.rv20 != null) setRv20(+t.rv20.toFixed(1));
   }, [loadedTicker]);
 
   // Load watchlist once on mount: from Supabase if configured and working, else localStorage
   useEffect(() => {
     const loadLocal = () => {
       try {
-        setWatchlist(JSON.parse(localStorage.getItem("optix_watchlist") || "[]"));
-      } catch {
+        const raw = JSON.parse(localStorage.getItem("optix_watchlist") || "[]");
+        const arr = Array.isArray(raw) ? raw : [];
+        setWatchlist(arr.map(normalizeWatchlistSnapshot).filter(Boolean));
+      } catch (e) {
+        reportError("watchlist localStorage parse", e);
         setWatchlist([]);
       }
     };
     if (isCloudEnabled()) {
       fetchStrategies().then(({ list, error }) => {
         if (error) loadLocal();
-        else setWatchlist(list);
+        else setWatchlist((list || []).map(normalizeWatchlistSnapshot).filter(Boolean));
       });
     } else {
       loadLocal();
@@ -582,7 +425,11 @@ export default function OptionsModel({ loadedTicker = null }) {
   const persistWatchlist = (wl) => {
     setWatchlist(wl);
     if (!isCloudEnabled()) {
-      try { localStorage.setItem("optix_watchlist", JSON.stringify(wl)); } catch { void 0; }
+      try {
+        localStorage.setItem("optix_watchlist", JSON.stringify(wl));
+      } catch (e) {
+        reportError("watchlist localStorage set", e);
+      }
     }
   };
 
@@ -606,15 +453,23 @@ export default function OptionsModel({ loadedTicker = null }) {
         const ok = await saveStrategy(name, snap);
         if (ok) {
           const { list } = await fetchStrategies();
-          setWatchlist(list);
+          setWatchlist((list || []).map(normalizeWatchlistSnapshot).filter(Boolean));
         } else {
           setWatchlist(updated);
-          try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch { void 0; }
+          try {
+            localStorage.setItem("optix_watchlist", JSON.stringify(updated));
+          } catch (e) {
+            reportError("watchlist localStorage set (cloud save fallback)", e);
+          }
         }
       } catch (e) {
-        console.warn("Cloud save failed, saving locally:", e);
+        reportError("Cloud save failed, saving locally", e);
         setWatchlist(updated);
-        try { localStorage.setItem("optix_watchlist", JSON.stringify(updated)); } catch { void 0; }
+        try {
+          localStorage.setItem("optix_watchlist", JSON.stringify(updated));
+        } catch (err) {
+          reportError("watchlist localStorage set (after cloud save error)", err);
+        }
       }
     } else {
       persistWatchlist(updated);
@@ -623,17 +478,24 @@ export default function OptionsModel({ loadedTicker = null }) {
   };
 
   const loadFromWatchlist = (snap) => {
-    setTicker(snap.ticker);
-    setSpot(snap.spot);
-        setExpiryDate(snap.expiryDate);
-    setLegs(snap.legs);
-    setStrategy(snap.strategy || "Custom");
-    setRv20(snap.rv20); setRv60(snap.rv60); setRv1y(snap.rv1y);
-    setIv1yPct(snap.iv1yPct);
-    setMargin(snap.margin || 20);
-    setSurfacePoints(snap.surfacePoints || []);
-    setSurfaceEnabled(snap.surfaceEnabled || false);
-    setSurfaceNextId(Math.max(100, ((snap.surfacePoints || []).length + 100)));
+    const s = normalizeWatchlistSnapshot(snap);
+    if (!s) {
+      reportError("loadFromWatchlist invalid snapshot", new Error("rejected"));
+      return;
+    }
+    setTicker(s.ticker);
+    setSpot(s.spot);
+    setExpiryDate(s.expiryDate);
+    setLegs(s.legs);
+    setStrategy(s.strategy || "Custom");
+    setRv20(s.rv20);
+    setRv60(s.rv60);
+    setRv1y(s.rv1y);
+    setIv1yPct(s.iv1yPct);
+    setMargin(s.margin || 20);
+    setSurfacePoints(s.surfacePoints || []);
+    setSurfaceEnabled(s.surfaceEnabled || false);
+    setSurfaceNextId(Math.max(100, ((s.surfacePoints || []).length + 100)));
     setWatchlistOpen(false);
   };
 
@@ -644,15 +506,23 @@ export default function OptionsModel({ loadedTicker = null }) {
         const ok = await deleteStrategy(tickerName);
         if (ok) {
           const { list } = await fetchStrategies();
-          setWatchlist(list);
+          setWatchlist((list || []).map(normalizeWatchlistSnapshot).filter(Boolean));
         } else {
           setWatchlist(filtered);
-          try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch { void 0; }
+          try {
+            localStorage.setItem("optix_watchlist", JSON.stringify(filtered));
+          } catch (e) {
+            reportError("watchlist localStorage set (delete fallback)", e);
+          }
         }
       } catch (e) {
-        console.warn("Cloud delete failed, updating locally:", e);
+        reportError("Cloud delete failed, updating locally", e);
         setWatchlist(filtered);
-        try { localStorage.setItem("optix_watchlist", JSON.stringify(filtered)); } catch { void 0; }
+        try {
+          localStorage.setItem("optix_watchlist", JSON.stringify(filtered));
+        } catch (err) {
+          reportError("watchlist localStorage set (after cloud delete error)", err);
+        }
       }
     } else {
       persistWatchlist(filtered);

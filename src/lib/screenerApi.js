@@ -7,50 +7,174 @@
  * first resolve the latest available date from each table.
  */
 import { supabase } from "./supabase.js";
+import {
+  CHAIN_IV_DECIMAL_MIN,
+  CHAIN_IV_DECIMAL_MAX,
+  CHAIN_MIN_BID,
+  CHAIN_MIN_OPEN_INTEREST,
+  CHAIN_MAX_SPREAD_RATIO,
+  CHAIN_MONEYNESS_LOW,
+  CHAIN_MONEYNESS_HIGH,
+  QC_IV_PCT_MIN,
+  QC_IV_PCT_MAX,
+  QC_PARITY_RISK_FREE,
+} from "./marketPolicy.js";
+import { reportError } from "./reportError.js";
+
+/** Default calendar span for vol surface history charts and IV-rank context (~1y). */
+export const SURFACE_HISTORY_CALENDAR_DAYS = 365;
+
+// ── Date helpers (YYYY-MM-DD, UTC calendar math) ─────────────────────────────
+
+function addCalendarDays(isoDate, deltaDays) {
+  const parts = String(isoDate).split("-").map(Number);
+  const y = parts[0], m = parts[1], d = parts[2];
+  if (!y || !m || !d) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  return dt.toISOString().slice(0, 10);
+}
 
 // ── Date resolution ───────────────────────────────────────────────────────────
 
 const _dateCache = {};
 
+/** Drop cached dates (e.g. after tests or if you need to force refresh). */
+export function clearLatestDateCache() {
+  for (const k of Object.keys(_dateCache)) delete _dateCache[k];
+}
+
 async function latestDate(table, dateCol = "as_of_date") {
-  if (_dateCache[table]) return _dateCache[table];
+  if (table in _dateCache) return _dateCache[table];
   if (!supabase) return null;
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from(table)
     .select(dateCol)
     .order(dateCol, { ascending: false })
     .limit(1)
-    .single();
-  _dateCache[table] = data?.[dateCol] ?? null;
-  return _dateCache[table];
+    .maybeSingle();
+  if (error) {
+    reportError(`latestDate(${table})`, error);
+    return null;
+  }
+  const val = data?.[dateCol] ?? null;
+  _dateCache[table] = val;
+  return val;
 }
 
 // ── Tab 1: Universe screener table ────────────────────────────────────────────
 
 export async function fetchUniverseData() {
-  if (!supabase) return { rows: [], asOfDate: null };
+  if (!supabase) {
+    return {
+      rows: [],
+      asOfDate: null,
+      errors: [
+        "Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env (real project values, not the example placeholders) and restart the dev server.",
+      ],
+    };
+  }
 
   const [latestSurface, latestScreener] = await Promise.all([
     latestDate("vol_surfaces"),
     latestDate("screener_output"),
   ]);
   const d = latestSurface ?? latestScreener;
+  const historyMinDate = d ? addCalendarDays(d, -(SURFACE_HISTORY_CALENDAR_DAYS - 1)) : null;
+
+  // Avoid .eq("as_of_date", null) and heavy history pulls when pipeline has not landed yet.
+  if (d == null) {
+    const { data: tickersOnly, error: tErr } = await supabase.from("tickers").select("*").eq("active", true);
+    if (tErr) reportError("fetchUniverseData tickers (no vol date)", tErr);
+    const tickers = tickersOnly || [];
+    const rows = tickers.map((tk) => ({
+      symbol: tk.symbol ?? tk.ticker,
+      sector: tk.sector,
+      atm_iv_30d: null,
+      atm_iv_60d: null,
+      atm_iv_90d: null,
+      atm_iv_180d: null,
+      term_slope: null,
+      skew_25d: null,
+      rv_20d: null,
+      iv_rv_spread: null,
+      total_opt_vol: null,
+      total_oi: null,
+      pc_ratio: null,
+      iv_rank: null,
+      iv_pct: null,
+      rank: null,
+      volume_ratio: null,
+      skew_zscore: null,
+      composite_score: null,
+      flags: [],
+    })).filter((r) => r.symbol);
+    const errors = [];
+    if (tErr) errors.push(`tickers: ${tErr.message}`);
+    else if (!rows.length) errors.push("tickers: 0 active rows (empty table, filter mismatch, or RLS denied SELECT).");
+    else
+      errors.push(
+        "No rows in vol_surfaces / screener_output yet — symbols load but IV/screener columns stay empty until the pipeline runs.",
+      );
+    return { rows, asOfDate: null, errors };
+  }
 
   const [screenerRes, surfaceRes, tickersRes, historyRes] = await Promise.all([
     supabase.from("screener_output").select("*").eq("as_of_date", latestScreener ?? d),
     supabase.from("vol_surfaces").select("*").eq("as_of_date", latestSurface ?? d),
     supabase.from("tickers").select("*").eq("active", true),
-    supabase
-      .from("vol_surfaces")
-      .select("symbol, as_of_date, atm_iv_30d")
-      .order("as_of_date", { ascending: false })
-      .limit(50 * 252),
+    (async () => {
+      const pageSize = 1000;
+      let offset = 0;
+      const rows = [];
+      for (;;) {
+        const { data, error } = await supabase
+          .from("vol_surfaces")
+          .select("symbol, as_of_date, atm_iv_30d")
+          .gte("as_of_date", historyMinDate)
+          .lte("as_of_date", d)
+          .order("as_of_date", { ascending: true })
+          .range(offset, offset + pageSize - 1);
+        if (error) return { data: null, error };
+        const chunk = data || [];
+        rows.push(...chunk);
+        if (chunk.length < pageSize) break;
+        offset += pageSize;
+      }
+      return { data: rows, error: null };
+    })(),
   ]);
 
-  const screener  = screenerRes.data  || [];
-  const surfaces  = surfaceRes.data   || [];
-  const tickers   = tickersRes.data   || [];
-  const history   = historyRes.data   || [];
+  const errors = [];
+  if (screenerRes.error) {
+    reportError("fetchUniverseData screener_output", screenerRes.error);
+    errors.push(`screener_output: ${screenerRes.error.message}`);
+  }
+  if (surfaceRes.error) {
+    reportError("fetchUniverseData vol_surfaces", surfaceRes.error);
+    errors.push(`vol_surfaces: ${surfaceRes.error.message}`);
+  }
+  if (tickersRes.error) {
+    reportError("fetchUniverseData tickers", tickersRes.error);
+    errors.push(`tickers: ${tickersRes.error.message}`);
+  }
+  if (historyRes.error) {
+    reportError("fetchUniverseData vol_surfaces history", historyRes.error);
+    errors.push(`vol_surfaces history: ${historyRes.error.message}`);
+  }
+
+  if (tickersRes.error) {
+    return { rows: [], asOfDate: d, errors };
+  }
+
+  const screener = screenerRes.data || [];
+  const surfaces = surfaceRes.data || [];
+  const tickers = tickersRes.data || [];
+  const history = historyRes.data || [];
+
+  if (!tickers.length) {
+    errors.push("tickers: 0 active rows (empty table, or RLS blocked read).");
+  }
 
   const histBySymbol = {};
   history.forEach((h) => {
@@ -62,7 +186,7 @@ export async function fetchUniverseData() {
   const screenerMap = Object.fromEntries(screener.map((s) => [s.symbol, s]));
 
   const rows = tickers.map((tk) => {
-    const sym = tk.symbol;
+    const sym = tk.symbol ?? tk.ticker;
     const s   = screenerMap[sym] || {};
     const v   = surfaceMap[sym]  || {};
     const ivH = histBySymbol[sym] || [];
@@ -91,19 +215,46 @@ export async function fetchUniverseData() {
   });
 
   rows.sort((a, b) => (b.composite_score ?? -999) - (a.composite_score ?? -999));
-  return { rows, asOfDate: d };
+  const validRows = rows.filter((r) => r.symbol);
+  return { rows: validRows, asOfDate: d, errors };
 }
 
 // ── Tab 2: Chart grid ─────────────────────────────────────────────────────────
 
-export async function fetchSurfaceHistory(days = 90) {
+/**
+ * Vol surface rows from the latest pipeline date back through `calendarDays` (inclusive).
+ * Paginates past the default PostgREST page size so a full universe × ~1y loads reliably.
+ */
+export async function fetchSurfaceHistory(calendarDays = SURFACE_HISTORY_CALENDAR_DAYS) {
   if (!supabase) return [];
-  const { data } = await supabase
-    .from("vol_surfaces")
-    .select("symbol, as_of_date, atm_iv_30d, atm_iv_60d, atm_iv_90d, atm_iv_180d, rv_20d, term_slope, skew_25d_30d")
-    .order("as_of_date", { ascending: true })
-    .limit(50 * days);
-  return data || [];
+  const latest = await latestDate("vol_surfaces");
+  if (!latest) return [];
+  const minDate = addCalendarDays(latest, -(calendarDays - 1));
+  if (!minDate) return [];
+
+  const pageSize = 1000;
+  let offset = 0;
+  const out = [];
+  for (;;) {
+    const { data, error } = await supabase
+      .from("vol_surfaces")
+      .select(
+        "symbol, as_of_date, atm_iv_30d, atm_iv_60d, atm_iv_90d, atm_iv_180d, rv_20d, term_slope, skew_25d_30d",
+      )
+      .gte("as_of_date", minDate)
+      .lte("as_of_date", latest)
+      .order("as_of_date", { ascending: true })
+      .range(offset, offset + pageSize - 1);
+    if (error) {
+      reportError("fetchSurfaceHistory vol_surfaces", error);
+      break;
+    }
+    const chunk = data || [];
+    out.push(...chunk);
+    if (chunk.length < pageSize) break;
+    offset += pageSize;
+  }
+  return out;
 }
 
 /**
@@ -129,15 +280,20 @@ export async function fetchTickerChainToday(symbol) {
  * Fetch daily equity price history for one ticker.
  * Used for computing rolling 20d realized vol to backfill the IV vs RV chart.
  */
-export async function fetchEquityHistory(symbol, days = 120) {
+/** Most recent `maxRows` equity closes (ascending by date) for RV / merge with IV series. */
+export async function fetchEquityHistory(symbol, maxRows = 120) {
   if (!supabase) return [];
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("equity_daily")
     .select("trade_date, close")
     .eq("symbol", symbol)
-    .order("trade_date", { ascending: true })
-    .limit(days);
-  return data || [];
+    .order("trade_date", { ascending: false })
+    .limit(maxRows);
+  if (error) {
+    reportError(`fetchEquityHistory(${symbol})`, error);
+    return [];
+  }
+  return (data || []).slice().reverse();
 }
 
 /**
@@ -181,17 +337,20 @@ export async function fetchTickerForModel(symbol) {
       .eq("symbol", symbol)
       .order("trade_date", { ascending: false })
       .limit(1)
-      .single(),
+      .maybeSingle(),
     supabase
       .from("vol_surfaces")
       .select("atm_iv_30d, rv_20d, as_of_date")
       .eq("symbol", symbol)
       .order("as_of_date", { ascending: false })
       .limit(1)
-      .single(),
+      .maybeSingle(),
   ]);
 
-  const spot    = equityRow.data?.close ?? null;
+  if (equityRow.error) reportError(`fetchTickerForModel equity (${symbol})`, equityRow.error);
+  if (surfaceRow.error) reportError(`fetchTickerForModel vol_surfaces (${symbol})`, surfaceRow.error);
+
+  const spot = equityRow.data?.close ?? null;
   const surface = surfaceRow.data ?? {};
 
   // Convert scraped chain → surfacePoints [{id, strike, expiry, iv}]
@@ -204,12 +363,18 @@ export async function fetchTickerForModel(symbol) {
   //   - moneyness 70-140% of spot (skip deep OTM garbage)
   const surfacePoints = chain
     .filter((r) => {
-      if (r.implied_vol < 0.03 || r.implied_vol > 3.0) return false;
-      if ((r.bid ?? 0) < 0.05) return false;
-      if ((r.open_interest ?? 0) < 5) return false;
+      if (
+        r.implied_vol == null ||
+        r.implied_vol < CHAIN_IV_DECIMAL_MIN ||
+        r.implied_vol > CHAIN_IV_DECIMAL_MAX
+      )
+        return false;
+      if ((r.bid ?? 0) < CHAIN_MIN_BID) return false;
+      if ((r.open_interest ?? 0) < CHAIN_MIN_OPEN_INTEREST) return false;
       const mid = ((r.bid ?? 0) + (r.ask ?? 0)) / 2;
-      if (mid > 0.10 && (r.ask - r.bid) / mid > 0.60) return false; // wide spread
-      if (spot && (r.strike < spot * 0.70 || r.strike > spot * 1.40)) return false;
+      if (mid > 0.1 && (r.ask - r.bid) / mid > CHAIN_MAX_SPREAD_RATIO) return false;
+      if (spot && (r.strike < spot * CHAIN_MONEYNESS_LOW || r.strike > spot * CHAIN_MONEYNESS_HIGH))
+        return false;
       return true;
     })
     .map((r, i) => ({
@@ -298,19 +463,20 @@ export async function fetchDataQC() {
 
   const d = await latestDate("vol_surfaces");
 
-  const [surfaceRes, tickersRes, chainRes, equityRes] = await Promise.all([
+  const [surfaceRes, tickersRes, chainRes] = await Promise.all([
     supabase.from("vol_surfaces").select("*").eq("as_of_date", d),
     supabase.from("tickers").select("*").eq("active", true),
-    // Full chain for all tickers on latest chain date — for gap + parity checks
-    // Do NOT filter by bid > 0 here; we need all rows for accurate row counts
     (async () => {
-      // Query directly to avoid stale _dateCache from prior calls
-      const { data: dateData } = await supabase
+      const { data: dateData, error: dateErr } = await supabase
         .from("options_chains")
         .select("as_of_date")
         .order("as_of_date", { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
+      if (dateErr) {
+        reportError("fetchDataQC chain date", dateErr);
+        return { data: [] };
+      }
       const chainDate = dateData?.as_of_date;
       if (!chainDate) return { data: [] };
       return supabase
@@ -320,18 +486,36 @@ export async function fetchDataQC() {
         .order("symbol").order("expiry").order("strike")
         .limit(60000);
     })(),
-    // Latest close per ticker for parity computation
-    supabase
-      .from("equity_daily")
-      .select("symbol, close, trade_date")
-      .order("trade_date", { ascending: false })
-      .limit(50),
   ]);
 
-  const surfaces   = surfaceRes.data || [];
-  const tickers    = tickersRes.data || [];
-  const chainRows  = chainRes.data   || [];
-  const equityRows = equityRes.data  || [];
+  const surfaces = surfaceRes.data || [];
+  const tickers = tickersRes.data || [];
+  const chainRows = chainRes.data || [];
+
+  const symbols = tickers.map((t) => t.symbol).filter(Boolean);
+  let equityRows = [];
+  if (symbols.length) {
+    const { data: eqDateRow, error: eqDateErr } = await supabase
+      .from("equity_daily")
+      .select("trade_date")
+      .order("trade_date", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (eqDateErr) reportError("fetchDataQC equity latest date", eqDateErr);
+    else if (eqDateRow?.trade_date) {
+      const BATCH = 500;
+      for (let i = 0; i < symbols.length; i += BATCH) {
+        const batch = symbols.slice(i, i + BATCH);
+        const { data, error } = await supabase
+          .from("equity_daily")
+          .select("symbol, close, trade_date")
+          .eq("trade_date", eqDateRow.trade_date)
+          .in("symbol", batch);
+        if (error) reportError(`fetchDataQC equity batch ${i}`, error);
+        else equityRows = equityRows.concat(data || []);
+      }
+    }
+  }
 
   const surfaceMap = Object.fromEntries(surfaces.map((s) => [s.symbol, s]));
   // latest close per symbol
@@ -370,8 +554,9 @@ export async function fetchDataQC() {
 
     // ── Check 3: IV out of range
     const badIV = rows.filter((r) => {
+      if (r.implied_vol == null || !Number.isFinite(r.implied_vol)) return false;
       const iv = r.implied_vol * 100;
-      return iv < 5 || iv > 500;
+      return iv < QC_IV_PCT_MIN || iv > QC_IV_PCT_MAX;
     });
     if (badIV.length > 0) issues.push({ code: "bad_iv", label: `${badIV.length} bad IV rows`, severity: "warn" });
 
@@ -410,12 +595,16 @@ export async function fetchDataQC() {
     });
 
     // ── Check 5: Put/call parity
-    const R = 0.0525;
+    const R = QC_PARITY_RISK_FREE;
     const callMap = {};
-    const putMap  = {};
+    const putMap = {};
     rows.forEach((r) => {
+      const bid = r.bid,
+        ask = r.ask;
+      if (bid == null || ask == null || !Number.isFinite(bid) || !Number.isFinite(ask)) return;
+      const mid = (bid + ask) / 2;
+      if (!Number.isFinite(mid)) return;
       const key = `${r.expiry}|${r.strike}`;
-      const mid = (r.bid + r.ask) / 2;
       if (r.option_type === "call") callMap[key] = { mid, dte: r.dte };
       else putMap[key] = { mid, dte: r.dte };
     });
@@ -424,7 +613,9 @@ export async function fetchDataQC() {
       if (!putMap[key] || spot == null) return;
       const [expiry, strikeStr] = key.split("|");
       const K = parseFloat(strikeStr);
-      const T = callMap[key].dte / 365;
+      const dte = callMap[key].dte;
+      const T = Number.isFinite(dte) ? dte / 365 : NaN;
+      if (!Number.isFinite(T) || T <= 0) return;
       const pv_fwd = spot - K * Math.exp(-R * T);
       const actual = callMap[key].mid - putMap[key].mid;
       const diff   = Math.abs(actual - pv_fwd);
@@ -443,7 +634,7 @@ export async function fetchDataQC() {
     if (!s) issues.push({ code: "no_surface", label: "No vol surface", severity: "missing" });
     else {
       if (s.atm_iv_30d == null) issues.push({ code: "no_iv30", label: "Missing 30d IV", severity: "warn" });
-      if (s.atm_iv_30d != null && (s.atm_iv_30d < 5 || s.atm_iv_30d > 500))
+      if (s.atm_iv_30d != null && (s.atm_iv_30d < QC_IV_PCT_MIN || s.atm_iv_30d > QC_IV_PCT_MAX))
         issues.push({ code: "iv_range", label: "IV out of range", severity: "warn" });
     }
 
